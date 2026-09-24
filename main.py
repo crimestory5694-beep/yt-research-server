@@ -316,6 +316,69 @@ async def messages_endpoint(request: Request):
         "error": {"code": -32601, "message": f"Method not found: {method}"}
     })
 
+@app.post("/mcp")
+async def mcp_streamable(request: Request):
+    """Streamable HTTP MCP endpoint — required for ChatGPT plugin."""
+    body = await request.json()
+    method = body.get("method")
+    req_id = body.get("id")
+    params = body.get("params", {})
+
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "yt-research-server", "version": "1.0.0"}
+        }
+    elif method == "notifications/initialized":
+        result = {}
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        try:
+            tool_result = await call_tool(tool_name, arguments)
+            result = {
+                "content": [{"type": "text", "text": json.dumps(tool_result, ensure_ascii=False)}],
+                "isError": False
+            }
+        except Exception as e:
+            result = {
+                "content": [{"type": "text", "text": str(e)}],
+                "isError": True
+            }
+    else:
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        })
+
+    return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+
+@app.get("/mcp")
+async def mcp_streamable_get(request: Request):
+    """GET /mcp — SSE stream for Streamable HTTP transport."""
+    async def event_stream():
+        yield make_event({
+            "jsonrpc": "2.0",
+            "method": "sse/endpoint",
+            "params": {"uri": "/mcp"}
+        })
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(15)
+            yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "yt-research-server", "protocol": "MCP SSE", "tools": len(TOOLS)}
+    return {"status": "ok", "name": "yt-research-server", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}

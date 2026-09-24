@@ -146,6 +146,13 @@ async def tool_get_channel_videos(channel_id: str, sort_by: str = "newest", max_
         hours_old = max((now - pub).total_seconds() / 3600, 1)
         days_old = hours_old / 24
         views = int(v["statistics"].get("viewCount", 0))
+        thumbnails = v["snippet"].get("thumbnails", {})
+        thumbnail_url = (
+            thumbnails.get("maxres", {}).get("url") or
+            thumbnails.get("high", {}).get("url") or
+            thumbnails.get("medium", {}).get("url") or
+            f"https://i.ytimg.com/vi/{v['id']}/hqdefault.jpg"
+        )
         results.append({
             "video_id": v["id"],
             "title": v["snippet"]["title"],
@@ -156,7 +163,9 @@ async def tool_get_channel_videos(channel_id: str, sort_by: str = "newest", max_
             "daily_views": int(views / days_old),
             "outlier_score": round(views / channel_avg, 2) if channel_avg > 0 else 0,
             "duration": v["contentDetails"]["duration"],
-            "within_28_days": int(days_old) <= 28
+            "within_28_days": int(days_old) <= 28,
+            "thumbnail_url": thumbnail_url,
+            "video_url": f"https://www.youtube.com/watch?v={v['id']}"
         })
     if sort_by == "popular":
         results.sort(key=lambda x: x["views"], reverse=True)
@@ -190,7 +199,25 @@ async def tool_search_youtube(query: str, published_after_days: int = 28, max_re
         pub = datetime.fromisoformat(item["snippet"]["publishedAt"].replace("Z", "+00:00"))
         hours_old = max((now - pub).total_seconds() / 3600, 1)
         views = int(stats.get("viewCount", 0))
-        output.append({"video_id": vid_id, "title": item["snippet"]["title"], "channel_id": item["snippet"]["channelId"], "channel_title": item["snippet"]["channelTitle"], "published_at": item["snippet"]["publishedAt"], "views": views, "vhsp": round(views / hours_old, 1), "likes": int(stats.get("likeCount", 0)), "duration": stats_map.get(vid_id, {}).get("contentDetails", {}).get("duration", "")})
+        thumbnails = item["snippet"].get("thumbnails", {})
+        thumbnail_url = (
+            thumbnails.get("high", {}).get("url") or
+            thumbnails.get("medium", {}).get("url") or
+            f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+        )
+        output.append({
+            "video_id": vid_id,
+            "title": item["snippet"]["title"],
+            "channel_id": item["snippet"]["channelId"],
+            "channel_title": item["snippet"]["channelTitle"],
+            "published_at": item["snippet"]["publishedAt"],
+            "views": views,
+            "vhsp": round(views / hours_old, 1),
+            "likes": int(stats.get("likeCount", 0)),
+            "duration": stats_map.get(vid_id, {}).get("contentDetails", {}).get("duration", ""),
+            "thumbnail_url": thumbnail_url,
+            "video_url": f"https://www.youtube.com/watch?v={vid_id}"
+        })
     output.sort(key=lambda x: x["views"], reverse=True)
     return {"query": query, "results": output}
 
@@ -218,7 +245,28 @@ async def tool_get_video_details(video_id: str) -> dict:
     now = datetime.now(timezone.utc)
     hours_old = max((now - pub).total_seconds() / 3600, 1)
     views = int(v["statistics"].get("viewCount", 0))
-    return {"video_id": video_id, "title": v["snippet"]["title"], "channel_id": v["snippet"]["channelId"], "channel_title": v["snippet"]["channelTitle"], "published_at": v["snippet"]["publishedAt"], "views": views, "likes": int(v["statistics"].get("likeCount", 0)), "comments": int(v["statistics"].get("commentCount", 0)), "duration": v["contentDetails"]["duration"], "vhsp": round(views / hours_old, 1), "hours_old": int(hours_old)}
+    thumbnails = v["snippet"].get("thumbnails", {})
+    thumbnail_url = (
+        thumbnails.get("maxres", {}).get("url") or
+        thumbnails.get("high", {}).get("url") or
+        thumbnails.get("medium", {}).get("url") or
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    )
+    return {
+        "video_id": video_id,
+        "title": v["snippet"]["title"],
+        "channel_id": v["snippet"]["channelId"],
+        "channel_title": v["snippet"]["channelTitle"],
+        "published_at": v["snippet"]["publishedAt"],
+        "views": views,
+        "likes": int(v["statistics"].get("likeCount", 0)),
+        "comments": int(v["statistics"].get("commentCount", 0)),
+        "duration": v["contentDetails"]["duration"],
+        "vhsp": round(views / hours_old, 1),
+        "hours_old": int(hours_old),
+        "thumbnail_url": thumbnail_url,
+        "video_url": f"https://www.youtube.com/watch?v={video_id}"
+    }
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":

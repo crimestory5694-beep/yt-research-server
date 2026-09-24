@@ -1,0 +1,285 @@
+openapi: 3.1.0
+info:
+  title: YouTube Research API
+  description: >
+    Fetches real YouTube data for Prompt A research workflow —
+    channel stats, outlier detection, video search, comments mining,
+    and velocity calculations. All data comes from YouTube Data API v3.
+  version: 1.0.0
+servers:
+  - url: https://YOUR-RAILWAY-URL.railway.app
+    description: Production server (replace with your Railway URL after deploy)
+
+paths:
+
+  /channel/stats:
+    get:
+      operationId: getChannelStats
+      summary: Get channel statistics
+      description: Returns subscriber count, total views, video count, and average views per video for a channel.
+      parameters:
+        - name: channel_id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: YouTube channel ID (e.g. UCxKVonxttzOS2wjJESi-eEA)
+      responses:
+        "200":
+          description: Channel stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel_id: { type: string }
+                  title: { type: string }
+                  subscribers: { type: integer }
+                  total_views: { type: integer }
+                  video_count: { type: integer }
+                  avg_views_per_video: { type: integer }
+
+  /channel/videos:
+    get:
+      operationId: getChannelVideos
+      summary: Get channel videos with stats
+      description: >
+        Returns recent or popular videos from a channel with view counts,
+        VHSP (lifetime avg views/hour), outlier score vs channel average,
+        and whether each video is within the 28-day window.
+      parameters:
+        - name: channel_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: sort_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [newest, popular]
+            default: newest
+        - name: max_results
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            maximum: 50
+      responses:
+        "200":
+          description: List of videos with stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel_avg_views: { type: integer }
+                  videos:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        video_id: { type: string }
+                        title: { type: string }
+                        published_at: { type: string }
+                        days_old: { type: integer }
+                        views: { type: integer }
+                        vhsp: { type: number }
+                        daily_views: { type: integer }
+                        outlier_score: { type: number }
+                        duration: { type: string }
+                        within_28_days: { type: boolean }
+
+  /channel/outliers:
+    get:
+      operationId: getChannelOutliers
+      summary: Find outlier videos in a channel
+      description: >
+        Returns only videos that exceed the outlier score threshold,
+        within the specified day window. Outlier score = video views / channel avg views.
+        Score >= 2.0 means video got 2x more views than average.
+      parameters:
+        - name: channel_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: min_outlier_score
+          in: query
+          required: false
+          schema:
+            type: number
+            default: 2.0
+        - name: within_days
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 28
+        - name: max_videos
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            maximum: 50
+      responses:
+        "200":
+          description: Outlier videos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel_id: { type: string }
+                  channel_avg_views: { type: integer }
+                  outlier_threshold: { type: number }
+                  within_days: { type: integer }
+                  outliers_found: { type: integer }
+                  outliers:
+                    type: array
+                    items:
+                      type: object
+
+  /search:
+    get:
+      operationId: searchYouTube
+      summary: Search YouTube videos
+      description: >
+        Searches YouTube for videos matching a query. Returns videos sorted by view count
+        with VHSP calculated. Use for Buckets 2, 4, and 5 in Prompt A.
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query (e.g. "criminal empire documentary", "cartel boss true story")
+        - name: published_after_days
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 28
+          description: Only return videos published within last N days
+        - name: max_results
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 25
+            maximum: 50
+        - name: min_duration
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [short, medium, long]
+            default: medium
+          description: "short = under 4min, medium = 4-20min, long = over 20min"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query: { type: string }
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        video_id: { type: string }
+                        title: { type: string }
+                        channel_id: { type: string }
+                        channel_title: { type: string }
+                        published_at: { type: string }
+                        views: { type: integer }
+                        vhsp: { type: number }
+                        likes: { type: integer }
+                        duration: { type: string }
+
+  /video/comments:
+    get:
+      operationId: getVideoComments
+      summary: Get high-engagement comments for demand mining
+      description: >
+        Returns comments filtered by minimum like count. Use for Bucket 3
+        gap mining — look for requests, frustrations, and topic demands.
+        Only comments with 10+ likes indicate shared demand.
+      parameters:
+        - name: video_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: min_likes
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 10
+          description: Minimum likes threshold (10+ = shared demand signal)
+        - name: max_results
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            maximum: 100
+      responses:
+        "200":
+          description: Filtered comments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  video_id: { type: string }
+                  min_likes_filter: { type: integer }
+                  qualifying_comments: { type: integer }
+                  comments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        comment_id: { type: string }
+                        text: { type: string }
+                        likes: { type: integer }
+                        published_at: { type: string }
+                        author: { type: string }
+
+  /video/details:
+    get:
+      operationId: getVideoDetails
+      summary: Get full details for a specific video
+      description: Returns view count, likes, comments, duration, and VHSP for a video.
+      parameters:
+        - name: video_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  video_id: { type: string }
+                  title: { type: string }
+                  channel_id: { type: string }
+                  channel_title: { type: string }
+                  published_at: { type: string }
+                  views: { type: integer }
+                  likes: { type: integer }
+                  comments: { type: integer }
+                  duration: { type: string }
+                  vhsp: { type: number }
+                  hours_old: { type: integer }

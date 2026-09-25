@@ -473,11 +473,17 @@ async def tool_keyword_research(keyword: str, max_suggestions: int = 8) -> dict:
 async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        transcript_list = await asyncio.to_thread(
-            YouTubeTranscriptApi.get_transcript, video_id, languages=[language, "en"]
+        api = YouTubeTranscriptApi()
+        transcript = await asyncio.to_thread(
+            api.fetch, video_id, languages=[language, "en"]
         )
-        full_text = " ".join([t["text"] for t in transcript_list])
-        segments = [{"text": t["text"], "start": round(t["start"], 1), "duration": round(t["duration"], 1)} for t in transcript_list]
+        segments = []
+        for snippet in transcript:
+            text = snippet.text if hasattr(snippet, 'text') else snippet.get('text', '')
+            start = snippet.start if hasattr(snippet, 'start') else snippet.get('start', 0)
+            duration = snippet.duration if hasattr(snippet, 'duration') else snippet.get('duration', 0)
+            segments.append({"text": text, "start": round(start, 1), "duration": round(duration, 1)})
+        full_text = " ".join([s["text"] for s in segments])
         return {
             "video_id": video_id,
             "language": language,

@@ -102,8 +102,8 @@ TOOLS = [
         }
     },
     {
-        "name": "keyword_research",
-        "description": "Research a keyword for YouTube. Returns autocomplete suggestions, competition count (how many videos exist), top video views (demand proof), and a keyword score. Use before finalizing titles.",
+        "name": "yt_keyword_research",
+        "description": "Research a keyword for YouTube using YOUR OWN server (not vidIQ). Returns autocomplete suggestions, competition count (how many videos exist), top video views (demand proof), and a keyword score. FREE — no credits needed. Use before finalizing titles.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -114,8 +114,8 @@ TOOLS = [
         }
     },
     {
-        "name": "get_video_transcript",
-        "description": "Get the full transcript/captions of a YouTube video. Returns the complete text. Useful for analyzing competitor scripts and content structure.",
+        "name": "yt_get_video_transcript",
+        "description": "Get the full transcript/captions of a YouTube video using YOUR OWN server (not NexLev). Returns the complete text. FREE — no credits or weekly limits. Useful for analyzing competitor scripts and content structure.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -501,9 +501,9 @@ async def call_tool(name: str, arguments: dict) -> Any:
         return await tool_get_video_comments(**arguments)
     elif name == "get_video_details":
         return await tool_get_video_details(**arguments)
-    elif name == "keyword_research":
+    elif name == "yt_keyword_research":
         return await tool_keyword_research(**arguments)
-    elif name == "get_video_transcript":
+    elif name == "yt_get_video_transcript":
         return await tool_get_video_transcript(**arguments)
     else:
         return {"error": f"Unknown tool: {name}"}

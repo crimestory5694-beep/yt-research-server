@@ -4,6 +4,7 @@ import httpx
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
+from statistics import median
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -37,34 +38,34 @@ TOOLS = [
     },
     {
         "name": "get_channel_videos",
-        "description": "Get recent or popular videos from a channel with view counts, VHSP, outlier score, and 28-day flag.",
+        "description": "Get recent or popular videos from a channel (up to 100). Returns views, VHSP, outlier score, likes, comments, relative pace vs channel baseline, momentum band (STRONG/MODERATE/NORMAL/DECLINING), thumbnail URL, and 28-day flag. Includes channel subscriber count.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "channel_id": {"type": "string", "description": "YouTube channel ID"},
                 "sort_by": {"type": "string", "enum": ["newest", "popular"], "default": "newest"},
-                "max_results": {"type": "integer", "default": 50, "maximum": 50}
+                "max_results": {"type": "integer", "default": 50, "maximum": 100}
             },
             "required": ["channel_id"]
         }
     },
     {
         "name": "get_channel_outliers",
-        "description": "Find videos that overperform relative to channel average. Outlier score = video views / channel avg views. Use for Prompt A Bucket 1.",
+        "description": "Find videos that overperform relative to channel average. Returns outlier score, relative pace, momentum band, subscriber count. Use for Prompt A Bucket 1.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "channel_id": {"type": "string", "description": "YouTube channel ID"},
                 "min_outlier_score": {"type": "number", "default": 2.0},
                 "within_days": {"type": "integer", "default": 28},
-                "max_videos": {"type": "integer", "default": 50}
+                "max_videos": {"type": "integer", "default": 50, "maximum": 100}
             },
             "required": ["channel_id"]
         }
     },
     {
         "name": "search_youtube",
-        "description": "Search YouTube for videos matching a query. Returns videos with view counts and VHSP. Use for Buckets 2, 4, 5.",
+        "description": "Search YouTube for videos matching a query. Returns videos with view counts, VHSP, likes, thumbnail. Use for Buckets 2, 4, 5.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -91,11 +92,35 @@ TOOLS = [
     },
     {
         "name": "get_video_details",
-        "description": "Get full stats for a specific video: views, likes, comments, duration, VHSP.",
+        "description": "Get full stats for a specific video: views, likes, comments, duration, VHSP, tags, thumbnail.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "video_id": {"type": "string", "description": "YouTube video ID"}
+            },
+            "required": ["video_id"]
+        }
+    },
+    {
+        "name": "keyword_research",
+        "description": "Research a keyword for YouTube. Returns autocomplete suggestions, competition count (how many videos exist), top video views (demand proof), and a keyword score. Use before finalizing titles.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "Keyword or phrase to research (e.g. 'cartel documentary', 'financial fraud')"},
+                "max_suggestions": {"type": "integer", "default": 8, "description": "How many autocomplete suggestions to return"}
+            },
+            "required": ["keyword"]
+        }
+    },
+    {
+        "name": "get_video_transcript",
+        "description": "Get the full transcript/captions of a YouTube video. Returns the complete text. Useful for analyzing competitor scripts and content structure.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "video_id": {"type": "string", "description": "YouTube video ID"},
+                "language": {"type": "string", "default": "en", "description": "Language code (default: en)"}
             },
             "required": ["video_id"]
         }
@@ -110,6 +135,25 @@ async def yt_get(endpoint: str, params: dict) -> dict:
         r = await client.get(f"{YT_BASE}/{endpoint}", params=params)
         r.raise_for_status()
         return r.json()
+
+def calc_momentum_band(relative_pace: float) -> str:
+    if relative_pace >= 3.0:
+        return "STRONG MOMENTUM"
+    elif relative_pace >= 1.5:
+        return "MODERATE MOMENTUM"
+    elif relative_pace >= 0.5:
+        return "NORMAL"
+    else:
+        return "DECLINING"
+
+def get_thumbnail(snippet: dict, video_id: str) -> str:
+    thumbnails = snippet.get("thumbnails", {})
+    return (
+        thumbnails.get("maxres", {}).get("url") or
+        thumbnails.get("high", {}).get("url") or
+        thumbnails.get("medium", {}).get("url") or
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    )
 
 async def tool_get_channel_stats(channel_id: str) -> dict:
     data = await yt_get("channels", {"part": "statistics,snippet", "id": channel_id})
@@ -128,52 +172,110 @@ async def tool_get_channel_stats(channel_id: str) -> dict:
     }
 
 async def tool_get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: int = 50) -> dict:
-    ch = await yt_get("channels", {"part": "contentDetails,statistics", "id": channel_id})
+    # Fetch channel info — subscribers + uploads playlist
+    ch = await yt_get("channels", {"part": "contentDetails,statistics,snippet", "id": channel_id})
     if not ch.get("items"):
         return {"error": "Channel not found"}
-    ch_stats = ch["items"][0]["statistics"]
+    ch_item = ch["items"][0]
+    ch_stats = ch_item["statistics"]
     channel_avg = int(ch_stats.get("viewCount", 0)) // max(int(ch_stats.get("videoCount", 1)), 1)
-    uploads_id = ch["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
-    pl = await yt_get("playlistItems", {"part": "contentDetails,snippet", "playlistId": uploads_id, "maxResults": min(max_results, 50)})
+    subscribers = int(ch_stats.get("subscriberCount", 0))
+    channel_title = ch_item["snippet"]["title"]
+    uploads_id = ch_item["contentDetails"]["relatedPlaylists"]["uploads"]
+
+    # Pagination — fetch up to 100 videos (2 pages of 50)
+    first_page_size = min(max_results, 50)
+    pl = await yt_get("playlistItems", {
+        "part": "contentDetails,snippet",
+        "playlistId": uploads_id,
+        "maxResults": first_page_size
+    })
     video_ids = [i["contentDetails"]["videoId"] for i in pl.get("items", [])]
+
+    # Second page if needed
+    next_token = pl.get("nextPageToken")
+    if next_token and max_results > 50:
+        second_page_size = min(max_results - 50, 50)
+        pl2 = await yt_get("playlistItems", {
+            "part": "contentDetails,snippet",
+            "playlistId": uploads_id,
+            "maxResults": second_page_size,
+            "pageToken": next_token
+        })
+        video_ids += [i["contentDetails"]["videoId"] for i in pl2.get("items", [])]
+
     if not video_ids:
-        return {"videos": [], "channel_avg_views": channel_avg}
-    vids = await yt_get("videos", {"part": "statistics,snippet,contentDetails", "id": ",".join(video_ids)})
+        return {"videos": [], "channel_avg_views": channel_avg, "subscribers": subscribers, "channel_title": channel_title}
+
+    # Fetch video stats — YouTube API allows max 50 IDs per call
+    all_vid_items = []
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i+50]
+        vids = await yt_get("videos", {"part": "statistics,snippet,contentDetails", "id": ",".join(chunk)})
+        all_vid_items.extend(vids.get("items", []))
+
     now = datetime.now(timezone.utc)
     results = []
-    for v in vids.get("items", []):
+    for v in all_vid_items:
         pub = datetime.fromisoformat(v["snippet"]["publishedAt"].replace("Z", "+00:00"))
         hours_old = max((now - pub).total_seconds() / 3600, 1)
-        days_old = hours_old / 24
+        days_old = max(hours_old / 24, 0.1)
         views = int(v["statistics"].get("viewCount", 0))
-        thumbnails = v["snippet"].get("thumbnails", {})
-        thumbnail_url = (
-            thumbnails.get("maxres", {}).get("url") or
-            thumbnails.get("high", {}).get("url") or
-            thumbnails.get("medium", {}).get("url") or
-            f"https://i.ytimg.com/vi/{v['id']}/hqdefault.jpg"
-        )
+        likes = int(v["statistics"].get("likeCount", 0))
+        comment_count = int(v["statistics"].get("commentCount", 0))
         results.append({
             "video_id": v["id"],
             "title": v["snippet"]["title"],
             "published_at": v["snippet"]["publishedAt"],
             "days_old": int(days_old),
             "views": views,
+            "likes": likes,
+            "comment_count": comment_count,
             "vhsp": round(views / hours_old, 1),
             "daily_views": int(views / days_old),
             "outlier_score": round(views / channel_avg, 2) if channel_avg > 0 else 0,
             "duration": v["contentDetails"]["duration"],
             "within_28_days": int(days_old) <= 28,
-            "thumbnail_url": thumbnail_url,
+            "thumbnail_url": get_thumbnail(v["snippet"], v["id"]),
             "video_url": f"https://www.youtube.com/watch?v={v['id']}"
         })
+
     if sort_by == "popular":
         results.sort(key=lambda x: x["views"], reverse=True)
-    return {"channel_avg_views": channel_avg, "videos": results}
+
+    # Calculate baseline pace — median daily_views of last 10 videos (by publish date)
+    by_date = sorted(results, key=lambda x: x["published_at"], reverse=True)
+    baseline_videos = by_date[:10]
+    baseline_daily_views_list = [v["daily_views"] for v in baseline_videos if v["daily_views"] > 0]
+    baseline_pace = median(baseline_daily_views_list) if baseline_daily_views_list else 0
+
+    # Add relative_pace and momentum_band to each video
+    for v in results:
+        if baseline_pace > 0:
+            v["relative_pace"] = round(v["daily_views"] / baseline_pace, 2)
+        else:
+            v["relative_pace"] = 0
+        v["momentum_band"] = calc_momentum_band(v["relative_pace"])
+
+    return {
+        "channel_id": channel_id,
+        "channel_title": channel_title,
+        "subscribers": subscribers,
+        "channel_avg_views": channel_avg,
+        "baseline_pace": int(baseline_pace),
+        "baseline_note": "Median daily views of last 10 videos",
+        "total_fetched": len(results),
+        "videos": results
+    }
 
 async def tool_get_channel_outliers(channel_id: str, min_outlier_score: float = 2.0, within_days: int = 28, max_videos: int = 50) -> dict:
     data = await tool_get_channel_videos(channel_id=channel_id, sort_by="newest", max_results=max_videos)
+    if "error" in data:
+        return data
     channel_avg = data.get("channel_avg_views", 0)
+    subscribers = data.get("subscribers", 0)
+    channel_title = data.get("channel_title", "")
+    baseline_pace = data.get("baseline_pace", 0)
     cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
     outliers = []
     for v in data.get("videos", []):
@@ -181,11 +283,29 @@ async def tool_get_channel_outliers(channel_id: str, min_outlier_score: float = 
         if pub >= cutoff and v["outlier_score"] >= min_outlier_score:
             outliers.append(v)
     outliers.sort(key=lambda x: x["outlier_score"], reverse=True)
-    return {"channel_id": channel_id, "channel_avg_views": channel_avg, "outlier_threshold": min_outlier_score, "within_days": within_days, "outliers_found": len(outliers), "outliers": outliers}
+    return {
+        "channel_id": channel_id,
+        "channel_title": channel_title,
+        "subscribers": subscribers,
+        "channel_avg_views": channel_avg,
+        "baseline_pace": baseline_pace,
+        "outlier_threshold": min_outlier_score,
+        "within_days": within_days,
+        "outliers_found": len(outliers),
+        "outliers": outliers
+    }
 
 async def tool_search_youtube(query: str, published_after_days: int = 28, max_results: int = 25, min_duration: str = "medium") -> dict:
     pub_after = (datetime.now(timezone.utc) - timedelta(days=published_after_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    results = await yt_get("search", {"part": "snippet", "q": query, "type": "video", "publishedAfter": pub_after, "maxResults": min(max_results, 50), "order": "viewCount", "videoDuration": min_duration})
+    results = await yt_get("search", {
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "publishedAfter": pub_after,
+        "maxResults": min(max_results, 50),
+        "order": "viewCount",
+        "videoDuration": min_duration
+    })
     video_ids = [i["id"]["videoId"] for i in results.get("items", [])]
     if not video_ids:
         return {"query": query, "results": []}
@@ -199,12 +319,6 @@ async def tool_search_youtube(query: str, published_after_days: int = 28, max_re
         pub = datetime.fromisoformat(item["snippet"]["publishedAt"].replace("Z", "+00:00"))
         hours_old = max((now - pub).total_seconds() / 3600, 1)
         views = int(stats.get("viewCount", 0))
-        thumbnails = item["snippet"].get("thumbnails", {})
-        thumbnail_url = (
-            thumbnails.get("high", {}).get("url") or
-            thumbnails.get("medium", {}).get("url") or
-            f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
-        )
         output.append({
             "video_id": vid_id,
             "title": item["snippet"]["title"],
@@ -214,8 +328,9 @@ async def tool_search_youtube(query: str, published_after_days: int = 28, max_re
             "views": views,
             "vhsp": round(views / hours_old, 1),
             "likes": int(stats.get("likeCount", 0)),
+            "comment_count": int(stats.get("commentCount", 0)),
             "duration": stats_map.get(vid_id, {}).get("contentDetails", {}).get("duration", ""),
-            "thumbnail_url": thumbnail_url,
+            "thumbnail_url": get_thumbnail(item["snippet"], vid_id),
             "video_url": f"https://www.youtube.com/watch?v={vid_id}"
         })
     output.sort(key=lambda x: x["views"], reverse=True)
@@ -245,13 +360,7 @@ async def tool_get_video_details(video_id: str) -> dict:
     now = datetime.now(timezone.utc)
     hours_old = max((now - pub).total_seconds() / 3600, 1)
     views = int(v["statistics"].get("viewCount", 0))
-    thumbnails = v["snippet"].get("thumbnails", {})
-    thumbnail_url = (
-        thumbnails.get("maxres", {}).get("url") or
-        thumbnails.get("high", {}).get("url") or
-        thumbnails.get("medium", {}).get("url") or
-        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-    )
+    tags = v["snippet"].get("tags", [])
     return {
         "video_id": video_id,
         "title": v["snippet"]["title"],
@@ -264,9 +373,120 @@ async def tool_get_video_details(video_id: str) -> dict:
         "duration": v["contentDetails"]["duration"],
         "vhsp": round(views / hours_old, 1),
         "hours_old": int(hours_old),
-        "thumbnail_url": thumbnail_url,
+        "tags": tags,
+        "thumbnail_url": get_thumbnail(v["snippet"], video_id),
         "video_url": f"https://www.youtube.com/watch?v={video_id}"
     }
+
+async def tool_keyword_research(keyword: str, max_suggestions: int = 8) -> dict:
+    # Step 1: YouTube Autocomplete — free, no API key needed
+    autocomplete_url = "https://suggestqueries.google.com/complete/search"
+    suggestions = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(autocomplete_url, params={
+                "client": "youtube",
+                "ds": "yt",
+                "q": keyword,
+                "hl": "en"
+            }, headers={"User-Agent": "Mozilla/5.0"})
+            raw = r.text
+            start = raw.find("[")
+            end = raw.rfind("]") + 1
+            if start != -1:
+                data = json.loads(raw[start:end])
+                if len(data) > 1 and isinstance(data[1], list):
+                    for item in data[1][:max_suggestions]:
+                        if isinstance(item, list) and item:
+                            suggestions.append(item[0])
+    except Exception:
+        suggestions = []
+
+    # Step 2: Competition count + top views for main keyword
+    competition_count = 0
+    top_views = []
+    try:
+        search_data = await yt_get("search", {
+            "part": "snippet",
+            "q": keyword,
+            "type": "video",
+            "maxResults": 10,
+            "order": "relevance",
+            "videoDuration": "medium"
+        })
+        video_ids = [i["id"]["videoId"] for i in search_data.get("items", [])]
+        competition_count = search_data.get("pageInfo", {}).get("totalResults", 0)
+        if video_ids:
+            vids = await yt_get("videos", {"part": "statistics", "id": ",".join(video_ids)})
+            views_list = [int(v["statistics"].get("viewCount", 0)) for v in vids.get("items", [])]
+            views_list.sort(reverse=True)
+            top_views = views_list[:3]
+    except Exception:
+        pass
+
+    # Step 3: Score calculation
+    avg_top_views = sum(top_views) / len(top_views) if top_views else 0
+    if avg_top_views >= 1_000_000:
+        demand = "HIGH"
+        demand_pts = 40
+    elif avg_top_views >= 200_000:
+        demand = "MEDIUM"
+        demand_pts = 25
+    elif avg_top_views >= 50_000:
+        demand = "LOW-MEDIUM"
+        demand_pts = 15
+    else:
+        demand = "LOW"
+        demand_pts = 5
+
+    if competition_count < 1000:
+        competition = "LOW"
+        comp_pts = 40
+    elif competition_count < 10000:
+        competition = "MEDIUM"
+        comp_pts = 25
+    elif competition_count < 100000:
+        competition = "HIGH"
+        comp_pts = 10
+    else:
+        competition = "VERY HIGH"
+        comp_pts = 0
+
+    total_score = demand_pts + comp_pts
+    if total_score >= 65:
+        grade = "STRONG"
+    elif total_score >= 40:
+        grade = "MODERATE"
+    else:
+        grade = "WEAK"
+
+    return {
+        "keyword": keyword,
+        "autocomplete_suggestions": suggestions,
+        "competition": {"total_videos": competition_count, "level": competition},
+        "demand": {"top_3_video_views": top_views, "avg_top_views": int(avg_top_views), "level": demand},
+        "keyword_score": total_score,
+        "grade": grade,
+        "interpretation": f"Demand: {demand} | Competition: {competition} | Score: {total_score}/80"
+    }
+
+async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        transcript_list = await asyncio.to_thread(
+            YouTubeTranscriptApi.get_transcript, video_id, languages=[language, "en"]
+        )
+        full_text = " ".join([t["text"] for t in transcript_list])
+        segments = [{"text": t["text"], "start": round(t["start"], 1), "duration": round(t["duration"], 1)} for t in transcript_list]
+        return {
+            "video_id": video_id,
+            "language": language,
+            "total_segments": len(segments),
+            "full_transcript": full_text,
+            "segments": segments[:200]
+        }
+    except Exception as e:
+        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}"}
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":
@@ -281,6 +501,10 @@ async def call_tool(name: str, arguments: dict) -> Any:
         return await tool_get_video_comments(**arguments)
     elif name == "get_video_details":
         return await tool_get_video_details(**arguments)
+    elif name == "keyword_research":
+        return await tool_keyword_research(**arguments)
+    elif name == "get_video_transcript":
+        return await tool_get_video_transcript(**arguments)
     else:
         return {"error": f"Unknown tool: {name}"}
 
@@ -292,14 +516,12 @@ def make_event(data: dict) -> str:
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     async def event_stream():
-        # Send endpoint event
         session_id = str(uuid.uuid4())
         yield make_event({
             "jsonrpc": "2.0",
             "method": "sse/endpoint",
             "params": {"uri": f"/messages?sessionId={session_id}"}
         })
-        # Keep alive
         while True:
             if await request.is_disconnected():
                 break
@@ -325,7 +547,7 @@ async def messages_endpoint(request: Request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "yt-research-server", "version": "1.0.0"}
+                "serverInfo": {"name": "yt-research-server", "version": "2.0.0"}
             }
         })
 
@@ -376,7 +598,7 @@ async def mcp_streamable(request: Request):
         result = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "yt-research-server", "version": "1.0.0"}
+            "serverInfo": {"name": "yt-research-server", "version": "2.0.0"}
         }
     elif method == "notifications/initialized":
         result = {}
@@ -429,4 +651,4 @@ async def mcp_streamable_get(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "yt-research-server", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}
+    return {"status": "ok", "name": "yt-research-server", "version": "2.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}

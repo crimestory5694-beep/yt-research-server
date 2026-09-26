@@ -21,6 +21,7 @@ app.add_middleware(
 
 API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyCiKq99ECwtFX98T7dpTNM0BiOIpLXxBLE")
 YT_BASE = "https://www.googleapis.com/youtube/v3"
+PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. "http://user:pass@proxy.host:port"
 
 # ─── MCP TOOL DEFINITIONS ────────────────────────────────────────────────────
 
@@ -646,7 +647,18 @@ async def tool_generate_titles(topic: str, niche: str = "documentary", max_title
 async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        api = YouTubeTranscriptApi()
+        from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
+
+        # Use proxy if configured — bypasses YouTube IP blocking on datacenter IPs
+        if PROXY_URL:
+            proxy_config = GenericProxyConfig(
+                http_url=PROXY_URL,
+                https_url=PROXY_URL,
+            )
+            api = YouTubeTranscriptApi(proxy_config=proxy_config)
+        else:
+            api = YouTubeTranscriptApi()
+
         transcript = await asyncio.to_thread(
             api.fetch, video_id, languages=[language, "en"]
         )
@@ -662,10 +674,11 @@ async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict
             "language": language,
             "total_segments": len(segments),
             "full_transcript": full_text,
-            "segments": segments[:200]
+            "segments": segments[:200],
+            "proxy_used": bool(PROXY_URL)
         }
     except Exception as e:
-        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}"}
+        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}", "proxy_used": bool(PROXY_URL)}
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":

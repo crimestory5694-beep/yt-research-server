@@ -22,6 +22,8 @@ app.add_middleware(
 API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyCiKq99ECwtFX98T7dpTNM0BiOIpLXxBLE")
 YT_BASE = "https://www.googleapis.com/youtube/v3"
 PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. "http://user:pass@proxy.host:port"
+WEBSHARE_USER = os.environ.get("WEBSHARE_USER", "")
+WEBSHARE_PASS = os.environ.get("WEBSHARE_PASS", "")
 
 # ─── MCP TOOL DEFINITIONS ────────────────────────────────────────────────────
 
@@ -649,8 +651,14 @@ async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 
-        # Use proxy if configured — bypasses YouTube IP blocking on datacenter IPs
-        if PROXY_URL:
+        # Priority: Webshare residential > Generic proxy > No proxy
+        if WEBSHARE_USER and WEBSHARE_PASS:
+            proxy_config = WebshareProxyConfig(
+                proxy_username=WEBSHARE_USER,
+                proxy_password=WEBSHARE_PASS,
+            )
+            api = YouTubeTranscriptApi(proxy_config=proxy_config)
+        elif PROXY_URL:
             proxy_config = GenericProxyConfig(
                 http_url=PROXY_URL,
                 https_url=PROXY_URL,
@@ -675,10 +683,10 @@ async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict
             "total_segments": len(segments),
             "full_transcript": full_text,
             "segments": segments[:200],
-            "proxy_used": bool(PROXY_URL)
+            "proxy_used": "webshare" if (WEBSHARE_USER and WEBSHARE_PASS) else bool(PROXY_URL)
         }
     except Exception as e:
-        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}", "proxy_used": bool(PROXY_URL)}
+        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}", "proxy_used": "webshare" if (WEBSHARE_USER and WEBSHARE_PASS) else bool(PROXY_URL)}
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":

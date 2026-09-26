@@ -114,6 +114,19 @@ TOOLS = [
         }
     },
     {
+        "name": "yt_generate_titles",
+        "description": "Generate optimized YouTube title variations for a topic. Analyzes top-performing videos on YouTube for that topic, extracts winning patterns, and generates 10 data-backed title options with scores. FREE — no credits needed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "The subject/person/event to make a video about (e.g. 'Pablo Escobar', 'Baker Street Robbery', 'Viktor Bout')"},
+                "niche": {"type": "string", "default": "documentary", "description": "Your channel niche for tone matching (e.g. 'crime documentary', 'psychology', 'horror', 'business')"},
+                "max_titles": {"type": "integer", "default": 10, "description": "How many title variations to generate (max 15)"}
+            },
+            "required": ["topic"]
+        }
+    },
+    {
         "name": "yt_get_video_transcript",
         "description": "Get the full transcript/captions of a YouTube video using YOUR OWN server (not NexLev). Returns the complete text. FREE — no credits or weekly limits. Useful for analyzing competitor scripts and content structure.",
         "inputSchema": {
@@ -470,6 +483,166 @@ async def tool_keyword_research(keyword: str, max_suggestions: int = 8) -> dict:
         "interpretation": f"Demand: {demand} | Competition: {competition} | Score: {total_score}/80"
     }
 
+async def tool_generate_titles(topic: str, niche: str = "documentary", max_titles: int = 10) -> dict:
+    import re
+    max_titles = min(max_titles, 15)
+
+    # Step 1: Search YouTube for this topic — get top performing videos
+    search_data = await yt_get("search", {
+        "part": "snippet",
+        "q": topic,
+        "type": "video",
+        "maxResults": 15,
+        "order": "viewCount",
+        "videoDuration": "medium"
+    })
+    video_ids = [i["id"]["videoId"] for i in search_data.get("items", [])]
+
+    top_titles = []
+    top_tags = []
+    if video_ids:
+        vids = await yt_get("videos", {"part": "statistics,snippet", "id": ",".join(video_ids)})
+        for v in vids.get("items", []):
+            views = int(v["statistics"].get("viewCount", 0))
+            title = v["snippet"]["title"]
+            tags = v["snippet"].get("tags", [])
+            top_titles.append({"title": title, "views": views})
+            top_tags.extend(tags[:5])  # top 5 tags per video
+
+    top_titles.sort(key=lambda x: x["views"], reverse=True)
+
+    # Step 2: Analyze patterns in top titles
+    all_titles_text = " ".join([t["title"] for t in top_titles])
+    patterns_found = {
+        "has_numbers": bool(re.search(r'\d+', all_titles_text)),
+        "has_questions": any(t["title"].strip().endswith("?") or t["title"].lower().startswith(("why", "how", "what", "who")) for t in top_titles),
+        "has_superlatives": any(word in all_titles_text.lower() for word in ["most", "worst", "deadliest", "biggest", "greatest", "richest", "dangerous"]),
+        "has_emotional": any(word in all_titles_text.lower() for word in ["shocking", "untold", "incredible", "insane", "unbelievable", "terrifying", "dark", "secret", "hidden"]),
+        "has_names": True,  # topic itself is usually a name
+        "avg_title_length": round(sum(len(t["title"]) for t in top_titles) / max(len(top_titles), 1)),
+    }
+
+    # Step 3: Get autocomplete data for the topic
+    suggestions = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://suggestqueries.google.com/complete/search", params={
+                "client": "youtube", "ds": "yt", "q": topic, "hl": "en"
+            }, headers={"User-Agent": "Mozilla/5.0"})
+            raw = r.text
+            start = raw.find("[")
+            end = raw.rfind("]") + 1
+            if start != -1:
+                data = json.loads(raw[start:end])
+                if len(data) > 1 and isinstance(data[1], list):
+                    for item in data[1][:8]:
+                        if isinstance(item, list) and item:
+                            suggestions.append(item[0])
+    except Exception:
+        pass
+
+    # Step 4: Generate titles using proven formulas
+    # Extract useful fragments from autocomplete
+    angle_words = []
+    for s in suggestions:
+        # Get the part after the topic name
+        remainder = s.lower().replace(topic.lower(), "").strip()
+        if remainder and len(remainder) > 2:
+            angle_words.append(remainder)
+
+    # Title formula templates — organized by type
+    formulas = [
+        # FORMULA 1: Name + Shocking Fact
+        {"type": "shocking_fact", "template": f"{topic} — The Story No One Tells You", "score": 75},
+        {"type": "shocking_fact", "template": f"The Untold Story of {topic}", "score": 72},
+        {"type": "shocking_fact", "template": f"{topic} — What Really Happened", "score": 70},
+
+        # FORMULA 2: Why/How Mystery
+        {"type": "mystery", "template": f"Why {topic} Was Impossible to Catch", "score": 78},
+        {"type": "mystery", "template": f"How {topic} Got Away With It for So Long", "score": 76},
+        {"type": "mystery", "template": f"Why Nobody Could Stop {topic}", "score": 74},
+
+        # FORMULA 3: Superlative + Niche
+        {"type": "superlative", "template": f"The Most Dangerous {niche.split()[0].title()} in History — {topic}", "score": 73},
+        {"type": "superlative", "template": f"{topic} — The {niche.split()[0].title()} That Shocked the World", "score": 71},
+
+        # FORMULA 4: Number + Extreme
+        {"type": "number", "template": f"{topic} — The Rise and Fall of a Criminal Empire", "score": 69},
+        {"type": "number", "template": f"Inside {topic}'s Secret World", "score": 67},
+
+        # FORMULA 5: Role Reveal / Identity
+        {"type": "role_reveal", "template": f"Who Was {topic}? The Full Story", "score": 65},
+        {"type": "role_reveal", "template": f"{topic} — From Nobody to the Most Wanted", "score": 74},
+
+        # FORMULA 6: Emotional hook
+        {"type": "emotional", "template": f"The Dark Truth About {topic}", "score": 77},
+        {"type": "emotional", "template": f"{topic} — The Story That Will Change How You Think", "score": 68},
+        {"type": "emotional", "template": f"The Real {topic} — What History Books Don't Tell You", "score": 76},
+    ]
+
+    # Add autocomplete-powered titles
+    for angle in angle_words[:3]:
+        formulas.append({
+            "type": "autocomplete",
+            "template": f"{topic} {angle.title()}",
+            "score": 60
+        })
+
+    # Boost scores based on patterns found in top videos
+    for f in formulas:
+        if f["type"] == "number" and patterns_found["has_numbers"]:
+            f["score"] += 5
+        if f["type"] == "mystery" and patterns_found["has_questions"]:
+            f["score"] += 5
+        if f["type"] == "superlative" and patterns_found["has_superlatives"]:
+            f["score"] += 5
+        if f["type"] == "emotional" and patterns_found["has_emotional"]:
+            f["score"] += 5
+        # Penalize if title is too long (>70 chars)
+        if len(f["template"]) > 70:
+            f["score"] -= 5
+        # Bonus for optimal length (40-65 chars)
+        if 40 <= len(f["template"]) <= 65:
+            f["score"] += 3
+
+    # Sort by score and take top N
+    formulas.sort(key=lambda x: x["score"], reverse=True)
+    generated = formulas[:max_titles]
+
+    # Assign grades
+    for g in generated:
+        if g["score"] >= 75:
+            g["grade"] = "A"
+        elif g["score"] >= 65:
+            g["grade"] = "B"
+        elif g["score"] >= 55:
+            g["grade"] = "C"
+        else:
+            g["grade"] = "D"
+
+    return {
+        "topic": topic,
+        "niche": niche,
+        "titles_generated": len(generated),
+        "generated_titles": [
+            {
+                "title": g["template"],
+                "type": g["type"],
+                "score": g["score"],
+                "grade": g["grade"],
+                "char_count": len(g["template"])
+            }
+            for g in generated
+        ],
+        "analysis": {
+            "top_youtube_titles": top_titles[:5],
+            "patterns_found": patterns_found,
+            "autocomplete_angles": suggestions,
+            "top_tags_from_competitors": list(set(top_tags))[:15]
+        },
+        "tip": "Grade A titles use patterns proven to get clicks in your niche. Combine the best title with a matching thumbnail for maximum CTR."
+    }
+
 async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
@@ -509,6 +682,8 @@ async def call_tool(name: str, arguments: dict) -> Any:
         return await tool_get_video_details(**arguments)
     elif name == "yt_keyword_research":
         return await tool_keyword_research(**arguments)
+    elif name == "yt_generate_titles":
+        return await tool_generate_titles(**arguments)
     elif name == "yt_get_video_transcript":
         return await tool_get_video_transcript(**arguments)
     else:
@@ -553,7 +728,7 @@ async def messages_endpoint(request: Request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "yt-research-server", "version": "2.0.0"}
+                "serverInfo": {"name": "yt-research-server", "version": "3.0.0"}
             }
         })
 
@@ -604,7 +779,7 @@ async def mcp_streamable(request: Request):
         result = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "yt-research-server", "version": "2.0.0"}
+            "serverInfo": {"name": "yt-research-server", "version": "3.0.0"}
         }
     elif method == "notifications/initialized":
         result = {}
@@ -657,4 +832,4 @@ async def mcp_streamable_get(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "yt-research-server", "version": "2.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}
+    return {"status": "ok", "name": "yt-research-server", "version": "3.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}

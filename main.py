@@ -21,9 +21,11 @@ app.add_middleware(
 
 API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyCiKq99ECwtFX98T7dpTNM0BiOIpLXxBLE")
 YT_BASE = "https://www.googleapis.com/youtube/v3"
-PROXY_URL = os.environ.get("PROXY_URL", "")  # e.g. "http://user:pass@proxy.host:port"
+PROXY_URL = os.environ.get("PROXY_URL", "")
 WEBSHARE_USER = os.environ.get("WEBSHARE_USER", "")
 WEBSHARE_PASS = os.environ.get("WEBSHARE_PASS", "")
+TRANSCRIPT_API_KEY = os.environ.get("TRANSCRIPT_API_KEY", "")  # TranscriptAPI.com — 100 free/month
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "")      # Supadata.ai — 100 free/month
 
 # ─── MCP TOOL DEFINITIONS ────────────────────────────────────────────────────
 
@@ -647,44 +649,77 @@ async def tool_generate_titles(topic: str, niche: str = "documentary", max_title
     }
 
 async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
-    # METHOD 1: youtube-transcript.ai — free, no key, no proxy needed
-    try:
-        url = f"https://youtube-transcript.ai/transcript/{video_id}.txt"
-        params = {}
-        if language and language != "en":
-            params["lang"] = language
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(url, params=params)
-            if r.status_code == 200 and len(r.text.strip()) > 50:
-                raw_text = r.text.strip()
-                # Parse the markdown response — extract transcript text after metadata header
-                lines = raw_text.split("\n")
-                transcript_lines = []
-                in_transcript = False
-                for line in lines:
-                    # Skip metadata header lines (title, url, language, etc.)
-                    if line.startswith("---"):
-                        in_transcript = True
-                        continue
-                    if in_transcript and line.strip():
-                        # Remove timestamp markers like [0:00] or [1:23]
-                        import re
-                        clean = re.sub(r'\[\d+:\d+\]', '', line).strip()
-                        if clean:
-                            transcript_lines.append(clean)
-                full_text = " ".join(transcript_lines) if transcript_lines else raw_text
-                return {
-                    "video_id": video_id,
-                    "language": language,
-                    "total_segments": len(transcript_lines),
-                    "full_transcript": full_text,
-                    "source": "youtube-transcript.ai",
-                    "proxy_used": False
-                }
-    except Exception:
-        pass  # Fall through to Method 2
+    # METHOD 1: TranscriptAPI.com — free 100 credits/month, no proxy needed
+    if TRANSCRIPT_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    "https://transcriptapi.com/api/v2/youtube/transcript",
+                    params={"video_url": video_id, "send_metadata": "true"},
+                    headers={"Authorization": f"Bearer {TRANSCRIPT_API_KEY}"}
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    # Extract transcript text from response
+                    segments = data.get("segments", data.get("transcript", []))
+                    if isinstance(segments, list) and len(segments) > 0:
+                        texts = []
+                        for seg in segments:
+                            if isinstance(seg, dict):
+                                texts.append(seg.get("text", ""))
+                            elif isinstance(seg, str):
+                                texts.append(seg)
+                        full_text = " ".join(t for t in texts if t)
+                        if len(full_text) > 50:
+                            return {
+                                "video_id": video_id,
+                                "language": language,
+                                "total_segments": len(segments),
+                                "full_transcript": full_text,
+                                "source": "transcriptapi.com",
+                                "proxy_used": False
+                            }
+                    # If response is plain text content
+                    elif isinstance(data, dict) and data.get("content"):
+                        return {
+                            "video_id": video_id,
+                            "language": language,
+                            "full_transcript": data["content"],
+                            "source": "transcriptapi.com",
+                            "proxy_used": False
+                        }
+        except Exception:
+            pass  # Fall through to Method 2
 
-    # METHOD 2: youtube-transcript-api library with optional proxy
+    # METHOD 2: Supadata.ai — free 100 credits/month, no proxy needed
+    if SUPADATA_API_KEY:
+        try:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            params = {"url": video_url, "text": "true"}
+            if language and language != "en":
+                params["lang"] = language
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    "https://api.supadata.ai/v1/transcript",
+                    params=params,
+                    headers={"x-api-key": SUPADATA_API_KEY}
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    content = data.get("content", "")
+                    if content and len(content) > 50:
+                        return {
+                            "video_id": video_id,
+                            "language": data.get("lang", language),
+                            "full_transcript": content,
+                            "available_languages": data.get("availableLangs", []),
+                            "source": "supadata.ai",
+                            "proxy_used": False
+                        }
+        except Exception:
+            pass  # Fall through to Method 3
+
+    # METHOD 3: youtube-transcript-api library with optional proxy
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig

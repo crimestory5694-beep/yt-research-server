@@ -647,11 +647,48 @@ async def tool_generate_titles(topic: str, niche: str = "documentary", max_title
     }
 
 async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict:
+    # METHOD 1: youtube-transcript.ai — free, no key, no proxy needed
+    try:
+        url = f"https://youtube-transcript.ai/transcript/{video_id}.txt"
+        params = {}
+        if language and language != "en":
+            params["lang"] = language
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, params=params)
+            if r.status_code == 200 and len(r.text.strip()) > 50:
+                raw_text = r.text.strip()
+                # Parse the markdown response — extract transcript text after metadata header
+                lines = raw_text.split("\n")
+                transcript_lines = []
+                in_transcript = False
+                for line in lines:
+                    # Skip metadata header lines (title, url, language, etc.)
+                    if line.startswith("---"):
+                        in_transcript = True
+                        continue
+                    if in_transcript and line.strip():
+                        # Remove timestamp markers like [0:00] or [1:23]
+                        import re
+                        clean = re.sub(r'\[\d+:\d+\]', '', line).strip()
+                        if clean:
+                            transcript_lines.append(clean)
+                full_text = " ".join(transcript_lines) if transcript_lines else raw_text
+                return {
+                    "video_id": video_id,
+                    "language": language,
+                    "total_segments": len(transcript_lines),
+                    "full_transcript": full_text,
+                    "source": "youtube-transcript.ai",
+                    "proxy_used": False
+                }
+    except Exception:
+        pass  # Fall through to Method 2
+
+    # METHOD 2: youtube-transcript-api library with optional proxy
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 
-        # Priority: Webshare residential > Generic proxy > No proxy
         if WEBSHARE_USER and WEBSHARE_PASS:
             proxy_config = WebshareProxyConfig(
                 proxy_username=WEBSHARE_USER,
@@ -683,10 +720,11 @@ async def tool_get_video_transcript(video_id: str, language: str = "en") -> dict
             "total_segments": len(segments),
             "full_transcript": full_text,
             "segments": segments[:200],
+            "source": "youtube-transcript-api",
             "proxy_used": "webshare" if (WEBSHARE_USER and WEBSHARE_PASS) else bool(PROXY_URL)
         }
     except Exception as e:
-        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}", "proxy_used": "webshare" if (WEBSHARE_USER and WEBSHARE_PASS) else bool(PROXY_URL)}
+        return {"video_id": video_id, "error": f"Transcript unavailable: {str(e)}", "source": "all methods failed"}
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":

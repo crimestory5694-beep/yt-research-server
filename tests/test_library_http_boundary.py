@@ -1,7 +1,7 @@
 """Runs the REAL youtube-transcript-api + REAL requests against CANNED YouTube responses
 (static assets shipped inside the library's own test suite) served by an in-process adapter.
 No network. Verifies our classification/selection logic against the library's real parsing.
-Not proof that live YouTube works from Railway."""
+Not proof that live YouTube works from Render or any cloud host."""
 import json
 import os
 

@@ -27,9 +27,14 @@ chain:  youtube_direct  ->  youtube_proxy (only if configured)  ->  transcriptap
 * **Languages:** `language` may be `es` or a priority list `es,pt`; English is tried last. `any_language=true` returns
   any available track. Manual captions are preferred over auto-generated; `caption_type` and `available_languages`
   are returned. `en` also matches `en-GB` etc.
-* **Cache:** SQLite at `TRANSCRIPT_CACHE_PATH` (default `$RAILWAY_VOLUME_MOUNT_PATH/transcript_cache.sqlite3`, else
-  `./.cache/`). Without a Railway Volume the cache and paid-usage counters reset on every deploy. If the path is not
-  writable the server falls back to memory and `/health/transcripts` reports `"persistent": false`.
+* **Cache:** SQLite at `TRANSCRIPT_CACHE_PATH` (default `./.cache/transcript_cache.sqlite3`). **On Render's free plan
+  the filesystem is ephemeral** (wiped on every restart, redeploy and idle spin-down), so the cache then only helps while
+  the instance stays awake. A persistent disk (paid plans only) is needed for durability. If the path is not writable
+  the server falls back to memory and `/health/transcripts` reports `"persistent": false`.
+* **Paid APIs and ephemeral storage:** monthly caps and cooldowns live in that SQLite file, so they would silently
+  reset on an ephemeral filesystem. Therefore paid providers are **refused** unless `TRANSCRIPT_CACHE_PATH` is set
+  explicitly (you assert it is on persistent storage) or `ALLOW_PAID_WITH_EPHEMERAL_STATE=true` (only sensible if the
+  provider account itself has a hard cap, e.g. a free plan).
 * **Limits:** at most `TRANSCRIPT_FETCHES_PER_MINUTE` uncached fetches/min server-wide (cache hits are free),
   `TRANSCRIPT_MAX_CONCURRENCY` parallel fetches, per-request and overall timeouts.
 
@@ -52,5 +57,7 @@ All tests are offline: provider APIs are mocked, YouTube is simulated at the HTT
 `python scripts/live_probe.py` (add `--with-proxy` only if a proxy is already configured) makes at most 1 reachability
 GET and 4 YouTube lookups, with paid APIs force-disabled. Verdicts: `FREE_EXTRACTION_WORKS`, `YOUTUBE_IP_BLOCKED`,
 `PROXY_CONFIG_FAILURE`, `NO_NETWORK_PATH_TO_YOUTUBE`, `INCONCLUSIVE_CAPTIONS_UNAVAILABLE_FOR_TESTED_VIDEOS`,
-`PROVIDER_OR_PARSER_ERROR`. Exit code 0 only on success. Run it in the environment you want to qualify (a Railway
-shell/one-off command), not locally: a laptop result says nothing about Railway's IP.
+`PROVIDER_OR_PARSER_ERROR`. Exit code 0 only on success. Run it on the host you want to qualify, not locally: a laptop
+result says nothing about Render's outbound IP. Without shell access (Render free) set
+`RUN_TRANSCRIPT_PROBE_ON_STARTUP=true` on a throwaway service and read the `TRANSCRIPT_PROBE_RESULT` line in its Logs.
+See `DEPLOY_STEPS.md`.

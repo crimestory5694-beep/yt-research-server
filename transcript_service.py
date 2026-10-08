@@ -129,6 +129,8 @@ class TranscriptConfig:
     proxy_url: str = ""
     proxy_retries: int = 3
     cache_path: str = ""
+    cache_path_explicit: bool = False
+    allow_paid_with_ephemeral_state: bool = False
     cache_ttl_seconds: int = 30 * 86400
     negative_ttl_seconds: int = 6 * 3600
     request_timeout: int = 20
@@ -148,10 +150,12 @@ class TranscriptConfig:
         order = [p.strip() for p in (e.get("TRANSCRIPT_PROVIDER_ORDER") or DEFAULT_ORDER).split(",") if p.strip()]
         known = set(FREE_PROVIDERS) | set(PAID_PROVIDERS)
         order = [p for p in order if p in known]
+        # The default location is on the host's (usually ephemeral) filesystem. Only an explicit
+        # TRANSCRIPT_CACHE_PATH is treated as an owner assertion that it sits on persistent storage.
         cache_path = e.get("TRANSCRIPT_CACHE_PATH", "")
+        explicit = bool(cache_path)
         if not cache_path:
-            vol = e.get("RAILWAY_VOLUME_MOUNT_PATH", "")
-            cache_path = os.path.join(vol, "transcript_cache.sqlite3") if vol else os.path.join(".cache", "transcript_cache.sqlite3")
+            cache_path = os.path.join(".cache", "transcript_cache.sqlite3")
         return cls(
             provider_order=order or DEFAULT_ORDER.split(","),
             enable_paid=_bool(e.get("ENABLE_PAID_TRANSCRIPT_APIS"), False),
@@ -162,6 +166,8 @@ class TranscriptConfig:
             proxy_url=e.get("PROXY_URL", ""),
             proxy_retries=_int(e.get("TRANSCRIPT_PROXY_RETRIES"), 3),
             cache_path=cache_path,
+            cache_path_explicit=explicit,
+            allow_paid_with_ephemeral_state=_bool(e.get("ALLOW_PAID_WITH_EPHEMERAL_STATE"), False),
             cache_ttl_seconds=_int(e.get("TRANSCRIPT_CACHE_TTL_DAYS"), 30) * 86400,
             negative_ttl_seconds=_int(e.get("TRANSCRIPT_NEGATIVE_TTL_HOURS"), 6) * 3600,
             request_timeout=_int(e.get("TRANSCRIPT_TIMEOUT_SECONDS"), 20),
@@ -255,7 +261,7 @@ def pick_transcript(available: list, languages: list):
 class TranscriptStore:
     def __init__(self, path: str):
         self.requested_path = path
-        self.persistent = True
+        self.persistent = path != ":memory:"
         self._lock = threading.Lock()
         try:
             if path != ":memory:":
@@ -579,6 +585,7 @@ class TranscriptService:
         return {
             "provider_order": self.cfg.provider_order,
             "paid_apis_enabled": self.cfg.enable_paid,
+            "paid_apis_effective": self.cfg.enable_paid and self._paid_state_trustworthy(),
             "providers": providers,
             "cache": {"persistent": self.store.persistent, "entries": self.store.stats(now)},
             "counters": dict(self._counters),
@@ -662,6 +669,8 @@ class TranscriptService:
                 return "paid_apis_disabled"
             if not self._configured(name):
                 return "not_configured"
+            if not self._paid_state_trustworthy():
+                return "ephemeral_state_paid_blocked"
             month = time.strftime("%Y-%m", time.gmtime(now))
             if self.cfg.paid_monthly_limit <= 0 or self.store.usage(name, month) >= self.cfg.paid_monthly_limit:
                 return "monthly_limit_reached"
@@ -671,6 +680,14 @@ class TranscriptService:
         if cd:
             return f"cooldown:{cd[1]}:{int(cd[0] - now)}s"
         return None
+
+    def _paid_state_trustworthy(self) -> bool:
+        """Monthly caps/cooldowns live in the SQLite store. On an ephemeral filesystem (e.g. Render free:
+        wiped on every restart/spin-down/deploy) they would silently reset, so paid calls are refused unless the
+        owner pointed TRANSCRIPT_CACHE_PATH at persistent storage or explicitly accepted the risk."""
+        if self.cfg.allow_paid_with_ephemeral_state:
+            return True
+        return bool(self.cfg.cache_path_explicit and self.store.persistent)
 
     def _after_failure(self, name: str, e: TranscriptError):
         now = self._clock()

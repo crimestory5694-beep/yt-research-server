@@ -6,7 +6,7 @@ import pytest
 import transcript_service as ts
 from tests.helpers import VID, Clock, E, FakeLibrary, PaidRecorder, good_data, make_service
 
-PAID_ENV = {"ENABLE_PAID_TRANSCRIPT_APIS": "true", "TRANSCRIPT_API_KEY": "tk_SECRET_123456",
+PAID_ENV = {"ENABLE_PAID_TRANSCRIPT_APIS": "true", "ALLOW_PAID_WITH_EPHEMERAL_STATE": "true", "TRANSCRIPT_API_KEY": "tk_SECRET_123456",
             "SUPADATA_API_KEY": "sd_SECRET_654321"}
 LONG = "hello world " * 20  # > 50 chars for paid parsers
 
@@ -392,3 +392,53 @@ def test_parse_supadata():
     r = ts.parse_supadata_response({"content": "c" * 60, "lang": "es", "availableLangs": ["es", "en"]})
     assert r["language_code"] == "es" and r["available_languages"] == ["es", "en"]
     assert ts.parse_supadata_response({"content": "tiny"}) is None
+
+
+# ── ephemeral filesystem (Render free): paid calls need trustworthy persistent counters ──
+EPH = {"ENABLE_PAID_TRANSCRIPT_APIS": "true", "TRANSCRIPT_API_KEY": "tk_SECRET_123456"}
+
+
+async def test_paid_refused_on_default_ephemeral_state():
+    paid = PaidRecorder((200, {"content": LONG}))
+    cfg = ts.TranscriptConfig.from_env(EPH)                       # no TRANSCRIPT_CACHE_PATH -> default, not explicit
+    cfg.cache_path = ":memory:"
+    svc = ts.TranscriptService(cfg, store=ts.TranscriptStore(":memory:"), library_fetch=FakeLibrary(E(ts.BLOCKED)),
+                               http_client_factory=paid.factory())
+    r = await svc.get_transcript(VID)
+    assert paid.requests == [] and any(a.get("reason") == "ephemeral_state_paid_blocked" for a in r["attempts"])
+    assert svc.diagnostics()["paid_apis_effective"] is False
+
+
+async def test_paid_allowed_with_explicit_persistent_path(tmp_path):
+    p = str(tmp_path / "state.sqlite3")
+    cfg = ts.TranscriptConfig.from_env({**EPH, "TRANSCRIPT_CACHE_PATH": p})
+    paid = PaidRecorder((200, {"content": LONG}))
+    svc = ts.TranscriptService(cfg, store=ts.TranscriptStore(p), library_fetch=FakeLibrary(E(ts.BLOCKED)),
+                               http_client_factory=paid.factory())
+    assert (await svc.get_transcript(VID))["status"] == "ok" and len(paid.requests) == 1
+
+
+async def test_explicit_memory_path_is_not_persistent():
+    cfg = ts.TranscriptConfig.from_env({**EPH, "TRANSCRIPT_CACHE_PATH": ":memory:"})
+    svc = ts.TranscriptService(cfg, store=ts.TranscriptStore(":memory:"), library_fetch=FakeLibrary(E(ts.BLOCKED)))
+    assert svc._paid_state_trustworthy() is False
+
+
+def test_default_cache_path_is_not_railway_specific(monkeypatch):
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", "/should/be/ignored"); monkeypatch.delenv("TRANSCRIPT_CACHE_PATH", raising=False)
+    cfg = ts.TranscriptConfig.from_env()
+    assert "should/be/ignored" not in cfg.cache_path and cfg.cache_path_explicit is False
+
+
+def test_restart_loses_state_on_ephemeral_fs_but_not_on_persistent(tmp_path):
+    """Simulates a Render restart: new process = new store object. File store survives, :memory: does not."""
+    for path, survives in ((str(tmp_path / "s.db"), True), (":memory:", False)):
+        a = ts.TranscriptStore(path); a.put("k", {"x": 1}, "positive", 100, 0); a.bump_usage("transcriptapi", "2026-10")
+        b = ts.TranscriptStore(path)
+        assert (b.get("k", 1) is not None) is survives and (b.usage("transcriptapi", "2026-10") == 1) is survives
+
+
+def test_unwritable_default_path_degrades_to_memory_with_visible_flag(tmp_path, monkeypatch):
+    ro = tmp_path / "ro"; ro.write_text("file, not dir")
+    st = ts.TranscriptStore(str(ro / "x" / "c.db"))
+    assert st.persistent is False

@@ -75,6 +75,9 @@ class SecurityMiddleware:
         if token:
             return "t:" + hashlib.sha256(token.encode()).hexdigest()[:16]
         headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        hdr = os.environ.get("CLIENT_IP_HEADER", "").strip().lower()  # e.g. true-client-ip, if your proxy sets it
+        if hdr and headers.get(hdr):
+            return "ip:" + headers[hdr].split(",")[0].strip()
         xff = headers.get("x-forwarded-for", "")
         if xff:  # rightmost entry is the one appended by the nearest (trusted) proxy
             return "ip:" + xff.split(",")[-1].strip()

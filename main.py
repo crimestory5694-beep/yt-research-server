@@ -846,6 +846,15 @@ async def mcp_streamable_get(request: Request):
     )
 
 
+@app.on_event("startup")
+async def _optional_startup_probe():
+    """OFF unless RUN_TRANSCRIPT_PROBE_ON_STARTUP=true. For hosts without shell access (Render free): logs one
+    TRANSCRIPT_PROBE_RESULT line. Paid providers are force-disabled inside the probe."""
+    if os.environ.get("RUN_TRANSCRIPT_PROBE_ON_STARTUP", "").strip().lower() in ("1", "true", "yes", "on"):
+        from transcript_probe import run_and_log
+        asyncio.create_task(run_and_log())
+
+
 @app.get("/health/transcripts")
 async def transcript_health():
     """Redacted transcript diagnostics (provider state, cache, counters). Auth-protected when enabled."""

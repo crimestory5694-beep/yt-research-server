@@ -81,3 +81,13 @@ def test_limiter_window_slides():
 def test_load_tokens():
     assert load_tokens({"MCP_AUTH_TOKEN": "a", "MCP_AUTH_TOKENS": "b, c"}) == ["b", "c", "a"]
     assert load_tokens({}) == []
+
+
+def test_client_ip_header_override_separates_clients_behind_shared_proxy(monkeypatch):
+    monkeypatch.setenv("CLIENT_IP_HEADER", "true-client-ip")
+    c = make_app(rate=1)
+    h1 = {"True-Client-IP": "1.1.1.1", "X-Forwarded-For": "9.9.9.9"}
+    h2 = {"True-Client-IP": "2.2.2.2", "X-Forwarded-For": "9.9.9.9"}   # same edge IP in XFF
+    assert c.post("/mcp", headers=h1).status_code == 200
+    assert c.post("/mcp", headers=h2).status_code == 200
+    assert c.post("/mcp", headers=h1).status_code == 429

@@ -46,3 +46,11 @@ chain:  youtube_direct  ->  youtube_proxy (only if configured)  ->  transcriptap
 pip install -r requirements-dev.txt && pytest
 ```
 All tests are offline: provider APIs are mocked, YouTube is simulated at the HTTP boundary.
+
+## Live verification (free, no credits)
+
+`python scripts/live_probe.py` (add `--with-proxy` only if a proxy is already configured) makes at most 1 reachability
+GET and 4 YouTube lookups, with paid APIs force-disabled. Verdicts: `FREE_EXTRACTION_WORKS`, `YOUTUBE_IP_BLOCKED`,
+`PROXY_CONFIG_FAILURE`, `NO_NETWORK_PATH_TO_YOUTUBE`, `INCONCLUSIVE_CAPTIONS_UNAVAILABLE_FOR_TESTED_VIDEOS`,
+`PROVIDER_OR_PARSER_ERROR`. Exit code 0 only on success. Run it in the environment you want to qualify (a Railway
+shell/one-off command), not locally: a laptop result says nothing about Railway's IP.

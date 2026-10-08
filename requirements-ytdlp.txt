@@ -1,0 +1,2 @@
+-r requirements.txt
+yt-dlp==2026.8.19

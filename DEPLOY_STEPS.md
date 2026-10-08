@@ -20,6 +20,13 @@ production service** (Dashboard -> production service -> Settings -> Region).
    `TRANSCRIPT_PROBE_RESULT` and copy it back (it contains no secrets and no transcript text).
 6. Delete the test service (Settings -> Delete Service), or at least suspend it.
 
+Optional additions to the **test service only** (still free):
+* Build command `pip install -r requirements-ytdlp.txt` and env `PROBE_YTDLP` = `true` -> the log line gains an
+  `extractors` matrix and `ytdlp_adds_value` (is yt-dlp better than the library from Render's IP?).
+* Env `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (from a free Upstash database you create) -> the log line gains
+  `remote_store: {"ok": true}` if the shared cache works. These are secrets: paste them only into Render's
+  Environment page, never into chat.
+
 Reading the `verdict`: `FREE_EXTRACTION_WORKS` · `YOUTUBE_IP_BLOCKED` · `PROXY_CONFIG_FAILURE` ·
 `NO_NETWORK_PATH_TO_YOUTUBE` · `INCONCLUSIVE_CAPTIONS_UNAVAILABLE_FOR_TESTED_VIDEOS` · `PROVIDER_OR_PARSER_ERROR`.
 Free instances sleep after ~15 minutes idle and restart on the next request; each start re-runs the probe, which is fine.
@@ -30,7 +37,9 @@ Free instances sleep after ~15 minutes idle and restart on the next request; eac
    create a new key restricted to *YouTube Data API v3*, set it as `YOUTUBE_API_KEY`, delete the old one, check usage.
    The branch has no fallback key; YouTube tools fail with a clear error until the variable is set.
 2. Optional: `MCP_AUTH_TOKEN` (clients must then send `Authorization: Bearer <token>`). Update clients first.
-3. Keep `ENABLE_PAID_TRANSCRIPT_APIS` unset. Paid APIs additionally refuse to run on an ephemeral filesystem.
+3. Keep `ENABLE_PAID_TRANSCRIPT_APIS` unset. Your existing `SUPADATA_API_KEY` / `TRANSCRIPT_API_KEY` stay in the
+   environment harmlessly; this branch never uses them unless that flag is `true` (and then only within the caps).
+   Note: the CURRENT production code (before this branch is deployed) still calls them first on every request. Paid APIs additionally refuse to run on an ephemeral filesystem.
 4. Deploy the branch to production only when you decide to.
 
 Never paste real keys into this repository, issues, or chat.

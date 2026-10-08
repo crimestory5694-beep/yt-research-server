@@ -858,7 +858,7 @@ async def _optional_startup_probe():
 @app.get("/health/transcripts")
 async def transcript_health():
     """Redacted transcript diagnostics (provider state, cache, counters). Auth-protected when enabled."""
-    return get_transcript_service().diagnostics()
+    return await get_transcript_service().diagnostics()
 
 
 @app.get("/")

@@ -81,8 +81,8 @@ DEFINITIVE = {
 NEGATIVE_CACHEABLE = DEFINITIVE - {INVALID_VIDEO_ID}
 
 PAID_PROVIDERS = ("transcriptapi", "supadata")
-FREE_PROVIDERS = ("youtube_direct", "youtube_proxy")
-DEFAULT_ORDER = "youtube_direct,youtube_proxy,transcriptapi,supadata"
+FREE_PROVIDERS = ("youtube_direct", "ytdlp", "youtube_proxy")
+DEFAULT_ORDER = "youtube_direct,ytdlp,youtube_proxy,transcriptapi,supadata"
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -138,7 +138,13 @@ class TranscriptConfig:
     max_concurrent_fetches: int = 4
     fetches_per_minute: int = 30
     block_cooldown_seconds: int = 300
-    paid_monthly_limit: int = 50
+    paid_monthly_limit: int = 25
+    paid_daily_limit: int = 5
+    provider_limits: dict = field(default_factory=dict)   # provider -> (monthly, daily) overrides
+    enable_ytdlp: bool = False
+    remote_url: str = ""
+    remote_token: str = ""
+    remote_prefix: str = "yt:"
     quota_cooldown_seconds: int = 12 * 3600
     auth_cooldown_seconds: int = 24 * 3600
     rate_cooldown_seconds: int = 900
@@ -175,12 +181,24 @@ class TranscriptConfig:
             max_concurrent_fetches=max(1, _int(e.get("TRANSCRIPT_MAX_CONCURRENCY"), 4)),
             fetches_per_minute=_int(e.get("TRANSCRIPT_FETCHES_PER_MINUTE"), 30),
             block_cooldown_seconds=_int(e.get("TRANSCRIPT_BLOCK_COOLDOWN_SECONDS"), 300),
-            paid_monthly_limit=_int(e.get("PAID_TRANSCRIPT_MONTHLY_LIMIT"), 50),
+            paid_monthly_limit=_int(e.get("PAID_TRANSCRIPT_MONTHLY_LIMIT"), 25),
+            paid_daily_limit=_int(e.get("PAID_TRANSCRIPT_DAILY_LIMIT"), 5),
+            provider_limits={
+                p: (_int(e.get(f"{p.upper()}_MONTHLY_LIMIT"), _int(e.get("PAID_TRANSCRIPT_MONTHLY_LIMIT"), 25)),
+                    _int(e.get(f"{p.upper()}_DAILY_LIMIT"), _int(e.get("PAID_TRANSCRIPT_DAILY_LIMIT"), 5)))
+                for p in PAID_PROVIDERS},
+            enable_ytdlp=_bool(e.get("ENABLE_YTDLP"), False),
+            remote_url=e.get("UPSTASH_REDIS_REST_URL", ""),
+            remote_token=e.get("UPSTASH_REDIS_REST_TOKEN", ""),
+            remote_prefix=e.get("REMOTE_CACHE_PREFIX", "yt:"),
         )
 
+    def limits_for(self, provider: str) -> tuple:
+        return self.provider_limits.get(provider, (self.paid_monthly_limit, self.paid_daily_limit))
+
     def secrets(self) -> list:
-        return [s for s in (self.transcript_api_key, self.supadata_api_key,
-                            self.webshare_user, self.webshare_pass) if s]
+        return [s for s in (self.transcript_api_key, self.supadata_api_key, self.webshare_user,
+                            self.webshare_pass, self.remote_token, self.remote_url) if s]
 
 
 # ─── redaction ───────────────────────────────────────────────────────────────
@@ -329,6 +347,24 @@ class TranscriptStore:
         with self._lock:
             row = self._db.execute("SELECT count FROM usage WHERE provider=? AND month=?", (provider, month)).fetchone()
         return row[0] if row else 0
+
+    def reserve(self, provider: str, month: str, day: str, month_limit: int, day_limit: int) -> Optional[str]:
+        """Atomic check-and-increment of the monthly and daily counters. None = reserved, else the reason."""
+        if month_limit <= 0:
+            return "monthly_limit_reached"
+        if day_limit <= 0:
+            return "daily_limit_reached"
+        with self._lock:
+            cur = {p: (self._db.execute("SELECT count FROM usage WHERE provider=? AND month=?", (provider, p)).fetchone() or (0,))[0]
+                   for p in (month, day)}
+            if cur[month] >= month_limit:
+                return "monthly_limit_reached"
+            if cur[day] >= day_limit:
+                return "daily_limit_reached"
+            for p in (month, day):
+                self._db.execute("INSERT INTO usage VALUES(?,?,1) ON CONFLICT(provider,month) DO UPDATE SET count=count+1", (provider, p))
+            self._db.commit()
+        return None
 
     def bump_usage(self, provider: str, month: str) -> int:
         with self._lock:
@@ -507,16 +543,23 @@ class TranscriptService:
     def __init__(self, config: Optional[TranscriptConfig] = None, store: Optional[TranscriptStore] = None,
                  clock: Callable[[], float] = time.time,
                  http_client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
-                 library_fetch: Optional[Callable[..., dict]] = None):
+                 library_fetch: Optional[Callable[..., dict]] = None,
+                 ytdlp_fetch: Optional[Callable[..., dict]] = None,
+                 remote=None):
         self.cfg = config or TranscriptConfig.from_env()
         self.store = store or TranscriptStore(self.cfg.cache_path)
         self._clock = clock
         self._http_factory = http_client_factory or (lambda: httpx.AsyncClient(timeout=self.cfg.request_timeout))
         self._library_fetch = library_fetch or fetch_with_library
+        self._ytdlp_fetch = ytdlp_fetch
+        self.remote = remote
+        if self.remote is None and self.cfg.remote_url and self.cfg.remote_token:
+            from remote_store import RemoteStore
+            self.remote = RemoteStore(self.cfg.remote_url, self.cfg.remote_token, self.cfg.remote_prefix)
         self._inflight: dict = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._fetch_times: deque = deque()
-        self._counters = {"requests": 0, "cache_hits": 0, "deduplicated": 0, "network_fetches": 0}
+        self._counters = {"requests": 0, "cache_hits": 0, "deduplicated": 0, "network_fetches": 0, "remote_cache_hits": 0}
 
     # -- public ------------------------------------------------------------
     async def get_transcript(self, video_id: str, language: str = "en", any_language: bool = False) -> dict:
@@ -527,9 +570,17 @@ class TranscriptService:
                 INVALID_VIDEO_ID, "Invalid video id: expected an 11-character YouTube video id or a YouTube URL"), [])
         languages = parse_languages(language)
         ctx = _Ctx(vid, languages, bool(any_language), language or "en")
-        key = f"{vid}|{','.join(l.lower() for l in languages)}|{int(ctx.any_language)}"
+        lang_part = ','.join(l.lower() for l in languages)
+        strict_key = f"{vid}|{lang_part}|0"
+        key = f"{vid}|{lang_part}|{int(ctx.any_language)}"
 
-        hit = self.store.get(key, self._clock())
+        if ctx.any_language:
+            hit = await self._cache_get(key)
+            if not hit:                          # may reuse an exact-language SUCCESS (never a strict "language missing")
+                h = await self._cache_get(strict_key)
+                hit = h if h and h[1] == "positive" else None
+        else:
+            hit = await self._cache_get(strict_key)
         if hit:
             self._counters["cache_hits"] += 1
             payload, kind = hit
@@ -557,27 +608,37 @@ class TranscriptService:
                 payload = self._error_payload(ctx, TranscriptError(UPSTREAM_ERROR, "Internal error: " + type(e).__name__), [])
             now = self._clock()
             if payload.get("status") == OK:
-                self.store.put(key, payload, "positive", self.cfg.cache_ttl_seconds, now)
+                await self._cache_put(key, payload, "positive", self.cfg.cache_ttl_seconds, now)
+                code = payload.get("language_code")
+                if key != strict_key and code and pick_transcript([(code, False, None)], languages):
+                    # the language really matched the request, so a normal (strict) request may reuse it too
+                    await self._cache_put(strict_key, payload, "positive", self.cfg.cache_ttl_seconds, now)
             elif payload.get("status") in NEGATIVE_CACHEABLE:
                 ttl = 3600 if payload["status"] == LANGUAGE_UNAVAILABLE else self.cfg.negative_ttl_seconds
-                self.store.put(key, payload, "negative", ttl, now)
+                await self._cache_put(key, payload, "negative", ttl, now)
             return self._present(payload, ctx, cached=False)
         finally:
             self._inflight.pop(key, None)
             if not fut.done():
                 fut.set_result(payload or self._error_payload(ctx, TranscriptError(UPSTREAM_ERROR, "Request aborted"), []))
 
-    def diagnostics(self) -> dict:
+    async def diagnostics(self) -> dict:
         now = self._clock()
         month = time.strftime("%Y-%m", time.gmtime(now))
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
         providers = {}
         for p in self.cfg.provider_order:
             info = {"configured": self._configured(p)}
             if p in PAID_PROVIDERS:
-                info["enabled"] = self.cfg.enable_paid
-                info["used_this_month"] = self.store.usage(p, month)
-                info["monthly_limit"] = self.cfg.paid_monthly_limit
-            cd = self.store.cooldown(p, now)
+                m_lim, d_lim = self.cfg.limits_for(p)
+                info.update(enabled=self.cfg.enable_paid, monthly_limit=m_lim, daily_limit=d_lim)
+                if self.remote is not None:
+                    info["used_this_month"] = await self.remote.usage(p, month)
+                    info["used_today"] = await self.remote.usage(p, day)
+                else:
+                    info["used_this_month"] = self.store.usage(p, month)
+                    info["used_today"] = self.store.usage(p, day)
+            cd = await self._cooldown(p, now)
             if cd:
                 info["cooldown_seconds_remaining"] = int(cd[0] - now)
                 info["cooldown_reason"] = cd[1]
@@ -587,7 +648,8 @@ class TranscriptService:
             "paid_apis_enabled": self.cfg.enable_paid,
             "paid_apis_effective": self.cfg.enable_paid and self._paid_state_trustworthy(),
             "providers": providers,
-            "cache": {"persistent": self.store.persistent, "entries": self.store.stats(now)},
+            "cache": {"local_persistent": self.store.persistent, "local_entries": self.store.stats(now),
+                      "remote": self.remote.diagnostics() if self.remote is not None else {"configured": False}},
             "counters": dict(self._counters),
             "library_available": YouTubeTranscriptApi is not None,
         }
@@ -596,6 +658,8 @@ class TranscriptService:
     def _configured(self, p: str) -> bool:
         if p == "youtube_direct":
             return True
+        if p == "ytdlp":
+            return self.cfg.enable_ytdlp and self._ytdlp_available()
         if p == "youtube_proxy":
             return bool((self.cfg.webshare_user and self.cfg.webshare_pass) or self.cfg.proxy_url)
         if p == "transcriptapi":
@@ -603,6 +667,46 @@ class TranscriptService:
         if p == "supadata":
             return bool(self.cfg.supadata_api_key)
         return False
+
+    def _ytdlp_available(self) -> bool:
+        if self._ytdlp_fetch is not None:
+            return True
+        import importlib.util
+        return importlib.util.find_spec("yt_dlp") is not None
+
+    # -- shared state helpers (remote store when configured, local SQLite otherwise) --
+    async def _cache_get(self, key: str):
+        hit = self.store.get(key, self._clock())
+        if hit:
+            return hit
+        if self.remote is not None:
+            r = await self.remote.get_cache(key)
+            if r:
+                self._counters["remote_cache_hits"] += 1
+                payload, kind = r
+                ttl = self.cfg.cache_ttl_seconds if kind == "positive" else self.cfg.negative_ttl_seconds
+                self.store.put(key, payload, kind, ttl, self._clock())  # warm local layer
+                return payload, kind
+        return None
+
+    async def _cache_put(self, key: str, payload: dict, kind: str, ttl: int, now: float):
+        self.store.put(key, payload, kind, ttl, now)
+        if self.remote is not None:
+            await self.remote.put_cache(key, payload, kind, ttl)
+
+    async def _cooldown(self, name: str, now: float):
+        local = self.store.cooldown(name, now)
+        if local or self.remote is None or name not in PAID_PROVIDERS:
+            return local
+        return await self.remote.get_cooldown(name, now)
+
+    async def _reserve_paid(self, name: str, now: float) -> Optional[str]:
+        month = time.strftime("%Y-%m", time.gmtime(now))
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        m_lim, d_lim = self.cfg.limits_for(name)
+        if self.remote is not None:
+            return await self.remote.reserve(name, month, day, m_lim, d_lim)  # fails closed
+        return self.store.reserve(name, month, day, m_lim, d_lim)
 
     def _proxy_config(self):
         if self.cfg.webshare_user and self.cfg.webshare_pass:
@@ -634,7 +738,9 @@ class TranscriptService:
         errors: list = []
         for name in self.cfg.provider_order:
             now = self._clock()
-            skip = self._skip_reason(name, now)
+            skip = await self._skip_reason(name, now)
+            if not skip and name in PAID_PROVIDERS:
+                skip = await self._reserve_paid(name, now)   # atomic usage reservation BEFORE the call
             if skip:
                 attempts.append({"provider": name, "outcome": "skipped", "reason": skip})
                 continue
@@ -648,7 +754,7 @@ class TranscriptService:
             try:
                 data, source, proxy_used = await self._call_provider(name, ctx)
             except TranscriptError as e:
-                self._after_failure(name, e)
+                await self._after_failure(name, e)
                 attempts.append({"provider": name, "outcome": e.status, "detail": redact(e.message, self.cfg.secrets())[:200]})
                 errors.append(e)
                 if e.definitive:
@@ -663,7 +769,7 @@ class TranscriptService:
             return self._success_payload(ctx, data, source, proxy_used, attempts)
         return self._error_payload(ctx, self._summarize(errors, attempts), attempts)
 
-    def _skip_reason(self, name: str, now: float) -> Optional[str]:
+    async def _skip_reason(self, name: str, now: float) -> Optional[str]:
         if name in PAID_PROVIDERS:
             if not self.cfg.enable_paid:
                 return "paid_apis_disabled"
@@ -671,12 +777,14 @@ class TranscriptService:
                 return "not_configured"
             if not self._paid_state_trustworthy():
                 return "ephemeral_state_paid_blocked"
-            month = time.strftime("%Y-%m", time.gmtime(now))
-            if self.cfg.paid_monthly_limit <= 0 or self.store.usage(name, month) >= self.cfg.paid_monthly_limit:
-                return "monthly_limit_reached"
+        elif name == "ytdlp":
+            if not self.cfg.enable_ytdlp:
+                return "ytdlp_disabled"
+            if not self._ytdlp_available():
+                return "ytdlp_not_installed"
         elif not self._configured(name):
             return "not_configured"
-        cd = self.store.cooldown(name, now)
+        cd = await self._cooldown(name, now)
         if cd:
             return f"cooldown:{cd[1]}:{int(cd[0] - now)}s"
         return None
@@ -685,11 +793,11 @@ class TranscriptService:
         """Monthly caps/cooldowns live in the SQLite store. On an ephemeral filesystem (e.g. Render free:
         wiped on every restart/spin-down/deploy) they would silently reset, so paid calls are refused unless the
         owner pointed TRANSCRIPT_CACHE_PATH at persistent storage or explicitly accepted the risk."""
-        if self.cfg.allow_paid_with_ephemeral_state:
-            return True
+        if self.cfg.allow_paid_with_ephemeral_state or self.remote is not None:
+            return True   # remote store: availability is enforced per reservation (fails closed)
         return bool(self.cfg.cache_path_explicit and self.store.persistent)
 
-    def _after_failure(self, name: str, e: TranscriptError):
+    async def _after_failure(self, name: str, e: TranscriptError):
         now = self._clock()
         until, reason = None, e.status
         if e.status == BLOCKED:
@@ -704,8 +812,12 @@ class TranscriptService:
             until = now + 60
         if until:
             self.store.set_cooldown(name, until, reason)
+            if self.remote is not None and name in PAID_PROVIDERS:   # quota/auth state must outlive restarts
+                await self.remote.set_cooldown(name, until, reason, now)
 
     async def _call_provider(self, name: str, ctx: _Ctx):
+        if name == "ytdlp":
+            return await self._call_ytdlp(ctx)
         if name in FREE_PROVIDERS:
             proxy_cfg, proxy_used = (None, False)
             if name == "youtube_proxy":
@@ -721,10 +833,18 @@ class TranscriptService:
             return data, "youtube-transcript-api", proxy_used
         return await self._call_paid(name, ctx)
 
+    async def _call_ytdlp(self, ctx: _Ctx):
+        from ytdlp_provider import fetch_with_ytdlp
+        fn = self._ytdlp_fetch or fetch_with_ytdlp
+        async with self._sem_get():
+            data = await asyncio.wait_for(
+                asyncio.to_thread(fn, ctx.video_id, ctx.languages, ctx.any_language,
+                                  self.cfg.request_timeout, self.cfg.secrets()),
+                timeout=self.cfg.request_timeout * 3 + 15)
+        return data, "yt-dlp", False
+
     async def _call_paid(self, name: str, ctx: _Ctx):
-        month = time.strftime("%Y-%m", time.gmtime(self._clock()))
-        self.store.bump_usage(name, month)  # count before the call: failures may still be billed
-        secrets = self.cfg.secrets()
+        secrets = self.cfg.secrets()   # usage was already reserved in _run_chain, before this call
         if name == "transcriptapi":
             req = dict(url="https://transcriptapi.com/api/v2/youtube/transcript",
                        params={"video_url": ctx.video_id, "send_metadata": "true"},
@@ -786,7 +906,8 @@ class TranscriptService:
         if self._configured("youtube_proxy"):
             return "A proxy is configured but also failed or is cooling down."
         return ("This is typical for cloud IPs. Options: configure a residential proxy "
-                "(WEBSHARE_USER/WEBSHARE_PASS or PROXY_URL), or set ENABLE_PAID_TRANSCRIPT_APIS=true with a provider key.")
+                "(WEBSHARE_USER/WEBSHARE_PASS or PROXY_URL), pre-fill the shared cache from a machine YouTube does not block "
+                "(scripts/prefetch_transcripts.py), or set ENABLE_PAID_TRANSCRIPT_APIS=true with a provider key.")
 
     # -- payload shaping ---------------------------------------------------
     def _success_payload(self, ctx: _Ctx, data: dict, source: str, proxy_used, attempts: list) -> dict:

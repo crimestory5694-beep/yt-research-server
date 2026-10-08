@@ -38,6 +38,34 @@ chain:  youtube_direct  ->  youtube_proxy (only if configured)  ->  transcriptap
 * **Limits:** at most `TRANSCRIPT_FETCHES_PER_MINUTE` uncached fetches/min server-wide (cache hits are free),
   `TRANSCRIPT_MAX_CONCURRENCY` parallel fetches, per-request and overall timeouts.
 
+## Reducing paid-credit dependence
+
+Order of defence, cheapest first: **shared persistent cache -> free `youtube-transcript-api` -> optional yt-dlp ->
+optional proxy -> paid APIs (off by default)**.
+
+* **Shared persistent cache (`remote_store.py`).** Set `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (an
+  Upstash Redis database; reported free tier: 256 MB, 500K commands/month, no card - verify on their site). Transcripts
+  (30 days), "no captions" answers (6 h), paid cooldowns and paid usage counters then survive Render restarts,
+  spin-downs and redeploys and are shared between instances. Values are zlib-compressed. A cache hit costs 1
+  Upstash command. If Upstash is unreachable, transcripts still work (local cache), but **paid calls fail closed**.
+  Render's own free Key Value is memory-only and loses data on restart, and free Render Postgres expires after
+  30 days, so neither is recommended.
+* **Enforceable paid caps.** Per provider: `SUPADATA_MONTHLY_LIMIT`, `SUPADATA_DAILY_LIMIT`,
+  `TRANSCRIPTAPI_MONTHLY_LIMIT`, `TRANSCRIPTAPI_DAILY_LIMIT` (defaults 25 / month and 5 / day via
+  `PAID_TRANSCRIPT_MONTHLY_LIMIT` / `PAID_TRANSCRIPT_DAILY_LIMIT`; `0` = never use). A slot is reserved atomically
+  *before* each paid call. Having the API keys in the environment does nothing unless
+  `ENABLE_PAID_TRANSCRIPT_APIS=true`.
+* **yt-dlp (optional, `ytdlp_provider.py`).** `ENABLE_YTDLP=true` + `pip install -r requirements-ytdlp.txt`. Reads subtitle
+  tracks only (no media download). It shares the server's IP, so it only helps if YouTube's blocking is not purely
+  IP-based; the probe's `extractors` matrix and `ytdlp_adds_value` field answer that on the real host. yt-dlp now
+  expects an external JavaScript runtime (e.g. Deno) for full YouTube support, which Render's native Python image does
+  not provide - another reason to measure before relying on it.
+* **Prefetch from an unblocked machine.** `scripts/prefetch_transcripts.py ID...` fills the shared cache from your own
+  computer (free providers only), so Render can serve those videos even if YouTube blocks Render.
+* **Speech-to-text (Whisper) is deliberately not implemented**: it needs the video's audio, which means downloading
+  media from YouTube (against its terms for third-party content, and it triggers the same IP blocks), and it cannot run
+  on Render Free (0.1 CPU / 512 MB). It is only reasonable for audio you own or are licensed to use, on your own hardware.
+
 ## Authentication & rate limiting (`security.py`)
 
 * `MCP_AUTH_TOKEN` (or comma-separated `MCP_AUTH_TOKENS`) unset -> **open, as before**. Set it to require

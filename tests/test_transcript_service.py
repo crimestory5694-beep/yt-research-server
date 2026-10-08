@@ -356,7 +356,7 @@ def test_redact_patterns():
 # ── config / diagnostics ──
 def test_config_defaults_are_free_and_safe():
     cfg = ts.TranscriptConfig.from_env({})
-    assert cfg.enable_paid is False and cfg.provider_order[:2] == ["youtube_direct", "youtube_proxy"]
+    assert cfg.enable_paid is False and cfg.provider_order[:3] == ["youtube_direct", "ytdlp", "youtube_proxy"] and cfg.enable_ytdlp is False
 
 
 def test_unknown_providers_in_order_ignored():
@@ -366,7 +366,7 @@ def test_unknown_providers_in_order_ignored():
 async def test_diagnostics_contains_no_secret_values():
     svc = make_service({**PAID_ENV, "WEBSHARE_USER": "u_SECRET", "WEBSHARE_PASS": "p_SECRET"}, lib=FakeLibrary(good_data()))
     await svc.get_transcript(VID)
-    d = svc.diagnostics()
+    d = await svc.diagnostics()
     assert "SECRET" not in str(d) and d["providers"]["transcriptapi"]["configured"] is True
     assert d["counters"]["requests"] == 1
 
@@ -406,7 +406,7 @@ async def test_paid_refused_on_default_ephemeral_state():
                                http_client_factory=paid.factory())
     r = await svc.get_transcript(VID)
     assert paid.requests == [] and any(a.get("reason") == "ephemeral_state_paid_blocked" for a in r["attempts"])
-    assert svc.diagnostics()["paid_apis_effective"] is False
+    assert (await svc.diagnostics())["paid_apis_effective"] is False
 
 
 async def test_paid_allowed_with_explicit_persistent_path(tmp_path):

@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -81,6 +82,7 @@ DEFINITIVE = {
 NEGATIVE_CACHEABLE = DEFINITIVE - {INVALID_VIDEO_ID}
 
 PAID_PROVIDERS = ("transcriptapi", "supadata")
+TRANSIENT = {"timeout", "network_error", "upstream_error"}
 FREE_PROVIDERS = ("youtube_direct", "ytdlp", "youtube_proxy")
 DEFAULT_ORDER = "youtube_direct,ytdlp,youtube_proxy,transcriptapi,supadata"
 
@@ -149,6 +151,12 @@ class TranscriptConfig:
     auth_cooldown_seconds: int = 24 * 3600
     rate_cooldown_seconds: int = 900
     max_segments_returned: int = 200
+    retries: int = 1                      # extra attempts for transient FREE-provider errors (never for paid)
+    backoff_seconds: float = 1.0          # delay = backoff * 2**attempt (+ jitter)
+    queue_wait_seconds: float = 20.0      # how long a request may wait for a fetch slot before rate_limited
+    queue_max: int = 50                   # max requests waiting for a slot at once
+    block_cooldown_max_seconds: int = 3600
+    local_cache_max_mb: int = 50
 
     @classmethod
     def from_env(cls, env=None) -> "TranscriptConfig":
@@ -181,6 +189,12 @@ class TranscriptConfig:
             max_concurrent_fetches=max(1, _int(e.get("TRANSCRIPT_MAX_CONCURRENCY"), 4)),
             fetches_per_minute=_int(e.get("TRANSCRIPT_FETCHES_PER_MINUTE"), 30),
             block_cooldown_seconds=_int(e.get("TRANSCRIPT_BLOCK_COOLDOWN_SECONDS"), 300),
+            block_cooldown_max_seconds=_int(e.get("TRANSCRIPT_BLOCK_COOLDOWN_MAX_SECONDS"), 3600),
+            retries=max(0, min(3, _int(e.get("TRANSCRIPT_RETRIES"), 1))),
+            backoff_seconds=float(_int(e.get("TRANSCRIPT_BACKOFF_MS"), 1000)) / 1000.0,
+            queue_wait_seconds=float(_int(e.get("TRANSCRIPT_QUEUE_WAIT_SECONDS"), 20)),
+            queue_max=max(0, _int(e.get("TRANSCRIPT_QUEUE_MAX"), 50)),
+            local_cache_max_mb=max(1, _int(e.get("TRANSCRIPT_LOCAL_CACHE_MAX_MB"), 50)),
             paid_monthly_limit=_int(e.get("PAID_TRANSCRIPT_MONTHLY_LIMIT"), 25),
             paid_daily_limit=_int(e.get("PAID_TRANSCRIPT_DAILY_LIMIT"), 5),
             provider_limits={
@@ -323,6 +337,29 @@ class TranscriptStore:
             self._db.execute("INSERT OR REPLACE INTO cache VALUES(?,?,?,?,?)",
                              (key, json.dumps(payload, ensure_ascii=False), kind, now, now + ttl))
             self._db.commit()
+
+    def purge(self, now: float, max_bytes: int) -> int:
+        """Drop expired rows, then oldest rows until the stored payload bytes fit. Returns rows deleted.
+        (Without this the local cache only deleted expired rows when they were read again.)"""
+        deleted = 0
+        with self._lock:
+            deleted += self._db.execute("DELETE FROM cache WHERE expires<=?", (now,)).rowcount
+            total = self._db.execute("SELECT COALESCE(SUM(LENGTH(payload)),0) FROM cache").fetchone()[0]
+            while total > max_bytes:
+                rows = self._db.execute("SELECT key, LENGTH(payload) FROM cache ORDER BY created LIMIT 50").fetchall()
+                if not rows:
+                    break
+                for k, n in rows:
+                    self._db.execute("DELETE FROM cache WHERE key=?", (k,))
+                    total -= n; deleted += 1
+                    if total <= max_bytes:
+                        break
+            self._db.commit()
+        return deleted
+
+    def size_bytes(self) -> int:
+        with self._lock:
+            return self._db.execute("SELECT COALESCE(SUM(LENGTH(payload)),0) FROM cache").fetchone()[0]
 
     def stats(self, now: float) -> dict:
         with self._lock:
@@ -559,7 +596,14 @@ class TranscriptService:
         self._inflight: dict = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._fetch_times: deque = deque()
-        self._counters = {"requests": 0, "cache_hits": 0, "deduplicated": 0, "network_fetches": 0, "remote_cache_hits": 0}
+        self._counters = {"requests": 0, "cache_hits": 0, "deduplicated": 0, "network_fetches": 0, "remote_cache_hits": 0,
+                          "retries": 0, "queued": 0, "rate_limited": 0, "purged_rows": 0}
+        self._outcomes: dict = {}                 # final status -> count since process start
+        self._recent: deque = deque(maxlen=20)    # last final outcomes (ok / fail) for the "everything failing" alert
+        self._block_streak: dict = {}             # provider -> consecutive blocks (escalating cooldown)
+        self._waiters = 0
+        self._puts = 0
+        self._alert_last: dict = {}
 
     # -- public ------------------------------------------------------------
     async def get_transcript(self, video_id: str, language: str = "en", any_language: bool = False) -> dict:
@@ -607,6 +651,12 @@ class TranscriptService:
                 log.exception("transcript chain crashed")
                 payload = self._error_payload(ctx, TranscriptError(UPSTREAM_ERROR, "Internal error: " + type(e).__name__), [])
             now = self._clock()
+            st = payload.get("status")
+            self._outcomes[st] = self._outcomes.get(st, 0) + 1
+            if st not in DEFINITIVE:                 # "no captions" etc. say nothing about provider health
+                self._recent.append(st == OK)
+                if len(self._recent) >= 10 and not any(self._recent):
+                    self._alert("all_free_providers_failing", "The last 10 live transcript attempts all failed")
             if payload.get("status") == OK:
                 await self._cache_put(key, payload, "positive", self.cfg.cache_ttl_seconds, now)
                 code = payload.get("language_code")
@@ -643,16 +693,49 @@ class TranscriptService:
                 info["cooldown_seconds_remaining"] = int(cd[0] - now)
                 info["cooldown_reason"] = cd[1]
             providers[p] = info
+        alerts = []
+        if self._recent and len(self._recent) >= 10 and not any(self._recent):
+            alerts.append("all_free_providers_failing")
+        if any(p.get("cooldown_reason") == BLOCKED for p in providers.values()):
+            alerts.append("youtube_blocked")
+        if self.remote is not None and not self.remote.available:
+            alerts.append("remote_store_unavailable")
+        if self.remote is None and not (self.cfg.cache_path_explicit and self.store.persistent):
+            alerts.append("cache_not_persistent_across_restarts")
+        if self.store.size_bytes() > 0.8 * self.cfg.local_cache_max_mb * 1_000_000:
+            alerts.append("local_cache_near_limit")
+        if self._counters["rate_limited"]:
+            alerts.append("rate_limit_rejections_since_start")
+        for p, info in providers.items():
+            if p in PAID_PROVIDERS and self.cfg.enable_paid and info.get("used_this_month") is not None:
+                for used, lim, tag in ((info["used_this_month"], info["monthly_limit"], "month"),
+                                       (info["used_today"], info["daily_limit"], "day")):
+                    if lim and used is not None and used >= lim:
+                        alerts.append(f"paid_{p}_{tag}_cap_reached")
+                    elif lim and used is not None and used >= 0.8 * lim:
+                        alerts.append(f"paid_{p}_{tag}_cap_80pct")
         return {
+            "alerts": alerts,
+            "outcomes_since_start": dict(self._outcomes),
+            "block_streaks": dict(self._block_streak),
+            "queue": {"waiting": self._waiters, "max": self.cfg.queue_max, "wait_seconds": self.cfg.queue_wait_seconds},
             "provider_order": self.cfg.provider_order,
             "paid_apis_enabled": self.cfg.enable_paid,
             "paid_apis_effective": self.cfg.enable_paid and self._paid_state_trustworthy(),
             "providers": providers,
             "cache": {"local_persistent": self.store.persistent, "local_entries": self.store.stats(now),
+                      "local_bytes": self.store.size_bytes(),
                       "remote": self.remote.diagnostics() if self.remote is not None else {"configured": False}},
             "counters": dict(self._counters),
             "library_available": YouTubeTranscriptApi is not None,
         }
+
+    def _alert(self, kind: str, message: str):
+        """Log a warning at most once per hour per kind (visible in Render Logs)."""
+        now = self._clock()
+        if now - self._alert_last.get(kind, -1e12) >= 3600:
+            self._alert_last[kind] = now
+            log.warning("TRANSCRIPT_ALERT %s: %s", kind, message)
 
     # -- internals ---------------------------------------------------------
     def _configured(self, p: str) -> bool:
@@ -690,9 +773,17 @@ class TranscriptService:
         return None
 
     async def _cache_put(self, key: str, payload: dict, kind: str, ttl: int, now: float):
+        # Only the first max_segments_returned segments are ever returned to clients, and the full text is kept
+        # separately, so storing every segment would just double the footprint (and the Upstash free-tier usage).
+        if payload.get("segments") and len(payload["segments"]) > self.cfg.max_segments_returned:
+            payload = {**payload, "segments": payload["segments"][:self.cfg.max_segments_returned]}
         self.store.put(key, payload, kind, ttl, now)
+        self._puts += 1
+        if self._puts % 25 == 0:
+            self._counters["purged_rows"] += self.store.purge(now, self.cfg.local_cache_max_mb * 1_000_000)
         if self.remote is not None:
-            await self.remote.put_cache(key, payload, kind, ttl)
+            if not await self.remote.put_cache(key, payload, kind, ttl):
+                self._alert("remote_store_unavailable", "Shared cache write failed; transcripts are only cached locally")
 
     async def _cooldown(self, name: str, now: float):
         local = self.store.cooldown(name, now)
@@ -733,40 +824,94 @@ class TranscriptService:
         self._fetch_times.append(now)
         return None
 
+    async def _acquire_slot(self) -> Optional[int]:
+        """Take one outbound-fetch slot (global per-minute cap). Waits up to queue_wait_seconds (bounded queue of
+        queue_max waiters) instead of failing instantly. Returns None when acquired, else retry_after seconds."""
+        t0 = time.monotonic()
+        queued = False
+        while True:
+            retry = self._local_rate_ok(self._clock())
+            if retry is None:
+                return None
+            remaining = self.cfg.queue_wait_seconds - (time.monotonic() - t0)
+            if remaining <= 0 or self._waiters >= self.cfg.queue_max:
+                self._counters["rate_limited"] += 1
+                self._alert("rate_limit_rejections", "Requests are being rejected by the server-side fetch rate limit")
+                return retry
+            if not queued:
+                queued = True
+                self._counters["queued"] += 1
+            self._waiters += 1
+            try:
+                await asyncio.sleep(min(retry, remaining, 1.0) + random.uniform(0, 0.15))
+            finally:
+                self._waiters -= 1
+
+    async def _attempt(self, name: str, ctx: _Ctx, attempts: list):
+        """One provider, with bounded exponential-backoff retries for transient errors (free providers only:
+        a retry of a paid call could be billed twice). Returns ('ok', result) | ('err', TranscriptError) | ('rate', err)."""
+        paid = name in PAID_PROVIDERS
+        tries = 0
+        while True:
+            self._counters["network_fetches"] += 1
+            hung = False
+            try:
+                return "ok", await self._call_provider(name, ctx)
+            except TranscriptError as e:
+                err = e
+            except asyncio.TimeoutError:
+                err, hung = TranscriptError(TIMEOUT, f"{name} timed out"), True   # a hung call already cost 2x timeout
+            if not paid and not hung and err.status in TRANSIENT and tries < self.cfg.retries:
+                tries += 1
+                self._counters["retries"] += 1
+                attempts.append({"provider": name, "outcome": err.status, "retry": tries})
+                await asyncio.sleep(self.cfg.backoff_seconds * (2 ** (tries - 1)) +
+                                    random.uniform(0, self.cfg.backoff_seconds * 0.25))
+                retry = await self._acquire_slot()
+                if retry is not None:
+                    return "rate", TranscriptError(LOCAL_RATE_LIMITED, "Server-side transcript fetch rate limit reached",
+                                                   retry_after=retry)
+                continue
+            return "err", err
+
     async def _run_chain(self, ctx: _Ctx) -> dict:
         attempts: list = []
         errors: list = []
         for name in self.cfg.provider_order:
             now = self._clock()
             skip = await self._skip_reason(name, now)
-            if not skip and name in PAID_PROVIDERS:
-                skip = await self._reserve_paid(name, now)   # atomic usage reservation BEFORE the call
             if skip:
                 attempts.append({"provider": name, "outcome": "skipped", "reason": skip})
                 continue
-            retry = self._local_rate_ok(now)
-            if retry is not None:
-                err = TranscriptError(LOCAL_RATE_LIMITED, "Server-side transcript fetch rate limit reached", retry_after=retry)
+            if name in PAID_PROVIDERS:
+                skip = await self._reserve_paid(name, now)   # atomic usage reservation BEFORE the call
+                if skip:
+                    attempts.append({"provider": name, "outcome": "skipped", "reason": skip})
+                    self._alert(f"paid_{skip}", f"Paid provider {name}: {skip}")
+                    continue
+            else:                                            # paid providers are bounded by their own caps instead
+                retry = await self._acquire_slot()
+                if retry is not None:
+                    err = TranscriptError(LOCAL_RATE_LIMITED, "Server-side transcript fetch rate limit reached", retry_after=retry)
+                    attempts.append({"provider": name, "outcome": LOCAL_RATE_LIMITED})
+                    errors.append(err)
+                    break
+            kind, res = await self._attempt(name, ctx, attempts)
+            if kind == "ok":
+                data, source, proxy_used = res
+                self._block_streak.pop(name, None)           # healthy again: reset escalating cooldown
+                attempts.append({"provider": name, "outcome": OK})
+                return self._success_payload(ctx, data, source, proxy_used, attempts)
+            e = res
+            if kind == "rate":
                 attempts.append({"provider": name, "outcome": LOCAL_RATE_LIMITED})
-                errors.append(err)
+                errors.append(e)
                 break
-            self._counters["network_fetches"] += 1
-            try:
-                data, source, proxy_used = await self._call_provider(name, ctx)
-            except TranscriptError as e:
-                await self._after_failure(name, e)
-                attempts.append({"provider": name, "outcome": e.status, "detail": redact(e.message, self.cfg.secrets())[:200]})
-                errors.append(e)
-                if e.definitive:
-                    return self._error_payload(ctx, e, attempts)
-                continue
-            except asyncio.TimeoutError:
-                e = TranscriptError(TIMEOUT, f"{name} timed out")
-                attempts.append({"provider": name, "outcome": TIMEOUT})
-                errors.append(e)
-                continue
-            attempts.append({"provider": name, "outcome": OK})
-            return self._success_payload(ctx, data, source, proxy_used, attempts)
+            await self._after_failure(name, e)
+            attempts.append({"provider": name, "outcome": e.status, "detail": redact(e.message, self.cfg.secrets())[:200]})
+            errors.append(e)
+            if e.definitive:
+                return self._error_payload(ctx, e, attempts)
         return self._error_payload(ctx, self._summarize(errors, attempts), attempts)
 
     async def _skip_reason(self, name: str, now: float) -> Optional[str]:
@@ -801,7 +946,9 @@ class TranscriptService:
         now = self._clock()
         until, reason = None, e.status
         if e.status == BLOCKED:
-            until = now + self.cfg.block_cooldown_seconds
+            n = self._block_streak[name] = self._block_streak.get(name, 0) + 1
+            until = now + min(self.cfg.block_cooldown_seconds * (2 ** (n - 1)), self.cfg.block_cooldown_max_seconds)
+            self._alert("youtube_blocked", f"YouTube blocked provider {name} (consecutive blocks: {n})")
         elif e.status == QUOTA_EXHAUSTED:
             until = now + self.cfg.quota_cooldown_seconds
         elif e.status == PROVIDER_AUTH_FAILED:
@@ -958,7 +1105,7 @@ class TranscriptService:
         out["language"] = out.get("language_code") or ctx.requested_language
         if segments:
             out["segments"] = segments[:cap]
-            out["segments_truncated"] = len(segments) > cap
+            out["segments_truncated"] = (out.get("total_segments") or len(segments)) > cap
         else:
             out.pop("total_segments", None)
         if out.get("total_segments") is None:

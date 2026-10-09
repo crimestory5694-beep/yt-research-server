@@ -60,7 +60,7 @@ class PaidRecorder:
 
 
 def make_service(env=None, lib=None, paid=None, clock=None):
-    base = {"TRANSCRIPT_CACHE_PATH": ":memory:"}
+    base = {"TRANSCRIPT_CACHE_PATH": ":memory:", "TRANSCRIPT_RETRIES": "0", "TRANSCRIPT_QUEUE_WAIT_SECONDS": "0"}
     base.update(env or {})
     cfg = TranscriptConfig.from_env(base)
     return TranscriptService(cfg, store=TranscriptStore(":memory:"), clock=clock or Clock(),
@@ -126,7 +126,7 @@ def make_remote(fake, clock=None, **kw):
 def make_service_remote(fake, env=None, lib=None, paid=None, clock=None, ytdlp=None):
     """Fresh service (fresh LOCAL sqlite = 'restarted Render instance') sharing one fake remote."""
     clock = clock or Clock()
-    base = {"TRANSCRIPT_CACHE_PATH": ":memory:"}
+    base = {"TRANSCRIPT_CACHE_PATH": ":memory:", "TRANSCRIPT_RETRIES": "0", "TRANSCRIPT_QUEUE_WAIT_SECONDS": "0"}
     base.update(env or {})
     cfg = TranscriptConfig.from_env(base)
     return TranscriptService(cfg, store=TranscriptStore(":memory:"), clock=clock,

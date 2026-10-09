@@ -239,5 +239,38 @@ async def main(quick=False):
     return out
 
 
+async def bounded(budget=110):
+    """50 and 100 unique transcripts/day. Hard time budget; each result is printed as soon as it exists."""
+    fast = {"TRANSCRIPT_BACKOFF_MS": "20"}          # real sleeps are used for backoff; keep them short here
+    t0 = time.time()
+    out = {}
+
+    async def step(name, coro):
+        if time.time() - t0 > budget:
+            out[name] = "SKIPPED: time budget"; return
+        out[name] = await coro
+        print(json.dumps({name: out[name]}), flush=True)
+    for n in (50, 100):
+        await step(f"steady_{n}_per_day_x2_days_each_asked_twice", steady(n, days=2, env=fast))
+        await step(f"memory_{n}_one_day_traced", _mem(n))
+        await step(f"burst_{n}_at_once", burst(n, {"TRANSCRIPT_QUEUE_WAIT_SECONDS": "1", **fast}))
+        await step(f"blocked_all_day_{n}", blocked_day(n, days=1, env=fast))
+        await step(f"transient_10pct_errors_{n}", transient(n, env=fast))
+    await step("restart_recovery_100", restarts(100, 25, fast))
+    await step("youtube_down_paid_enabled_capped_100_per_day_2_days", all_free_fail_paid_capped(100, 2, fast))
+    out["elapsed_s"] = round(time.time() - t0, 1)
+    out["process_maxrss_mb_includes_harness_and_tracemalloc"] = rss_mb()
+    return out
+
+
+async def _mem(n):
+    r = await steady(n, days=1, trace=True)
+    return {"py_heap_peak_mb": r["py_heap_peak_mb"]}
+
+
 if __name__ == "__main__":
-    print(json.dumps(asyncio.run(main("--quick" in sys.argv)), indent=1))
+    if "--bounded" in sys.argv:
+        res = asyncio.run(asyncio.wait_for(bounded(), timeout=118))
+        print(json.dumps({"FINAL": {"elapsed_s": res["elapsed_s"], "rss_mb": res["process_maxrss_mb_includes_harness_and_tracemalloc"]}}))
+    else:
+        print(json.dumps(asyncio.run(main("--quick" in sys.argv)), indent=1))

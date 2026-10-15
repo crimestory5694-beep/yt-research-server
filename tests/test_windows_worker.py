@@ -174,8 +174,8 @@ def test_original_worker_waking_up_late_cannot_duplicate_or_corrupt(st):
     st.clock.advance(400)                                                    # laptop slept; lease expired
     w2 = mkworker(st, Extractor(), worker_id="laptop-2")[0]
     run_until_idle(w2); st.clock.advance(61); run_until_idle(w2)             # laptop-2 recovers and finishes the job
-    code, body = api1.complete(job["job_id"], make_result(25))               # laptop-1 wakes and delivers its old result
-    assert code == 200 and body["state"] == "already_completed"
+    code, body = api1.complete(job["job_id"], job["fence"], make_result(25))   # laptop-1 wakes and delivers its old result
+    assert code == 409 and body["error"] == "stale_job"                       # rejected, stores nothing
     assert qsum()["completed_retained"] == 1
 
 
@@ -240,7 +240,7 @@ def test_lease_is_renewed_while_a_slow_extraction_runs(st):
     calls = {"renews": 0}
     w, s = mkworker(st, Extractor(), lease_seconds=60, renew_interval=0.05)
     real_renew = w.api.renew
-    w.api.renew = lambda j: (calls.__setitem__("renews", calls["renews"] + 1), real_renew(j))[1]
+    w.api.renew = lambda j, f: (calls.__setitem__("renews", calls["renews"] + 1), real_renew(j, f))[1]
     def slow(v, l):
         time.sleep(0.4); return make_result(10)
     w.extract = slow

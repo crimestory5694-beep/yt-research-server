@@ -35,6 +35,9 @@ class RedisBackedUpstash:
         self.top_level = 0         # commands received over the (fake) REST pipeline
         self.inner = 0             # commands executed inside Lua scripts
         self.eval_calls = 0
+        self.current_keys = set()      # keys declared by the EVAL currently running
+        self.undeclared = []           # (command, key) touched inside a script but NOT declared in KEYS
+        self.requests = []             # raw REST request bodies, for protocol-shape assertions
 
     # command accounting: count every command fakeredis executes, split by origin
     def _install_counter(self):
@@ -44,6 +47,10 @@ class RedisBackedUpstash:
         def counting(sock, func, sig, args, from_script):
             if from_script:
                 outer.inner += 1
+                if args:
+                    k = args[0].decode() if isinstance(args[0], bytes) else str(args[0])
+                    if k not in outer.current_keys:
+                        outer.undeclared.append((getattr(func, "__name__", "?"), k))
             return orig(sock, func, sig, args, from_script)
         _fr_base.BaseFakeSocket._run_command = counting
         self._restore = lambda: setattr(_fr_base.BaseFakeSocket, "_run_command", orig)
@@ -55,10 +62,13 @@ class RedisBackedUpstash:
         if request.headers.get("authorization") != f"Bearer {self.token}":
             return httpx.Response(401, json={"error": "Unauthorized"})
         out = []
-        for cmd in json.loads(request.content):
+        body = json.loads(request.content)
+        self.requests.append({"url": str(request.url), "body": body})
+        for cmd in body:
             self.top_level += 1
             if str(cmd[0]).upper() == "EVAL":
                 self.eval_calls += 1
+                self.current_keys = {str(k) for k in cmd[3:3 + int(cmd[2])]}
             try:
                 res = self.redis.execute_command(*cmd)
                 out.append({"result": to_resp2(res)})

@@ -7,16 +7,24 @@ Not verified against a live Upstash database yet - see docs/WORKER_AND_QUEUE.md 
 
 Data model (prefix P = "yt:q:"):
   P jobs     HASH   field = job_id ("<video_id>:<language>"), value = "status|video|lang|attempts|defers|created|
-                    updated|owner|lease_until|fail_class|message|not_before"   (no JSON: cjson is not documented
-                    for Upstash, so records are split/joined in plain Lua)
+                    updated|owner|lease_until|fail_class|message|not_before|fence|claimed_by"   (no JSON: cjson is
+                    not documented for Upstash, so records are split/joined in plain Lua)
   P pending  ZSET   job_id -> not_before   (pending AND deferred jobs; claimable when score <= now)
   P leases   ZSET   job_id -> lease_until  (processing jobs)
   P stats    HASH   counters and n:<status> gauges
   P done     ZSET   job_id -> finished time (completed/failed records, pruned after retention)
 
 Status machine: pending -> processing -> completed | failed | pending (retry) | deferred (blocked, retry later).
-Guarantees: a job is acknowledged to the caller only after the EVAL that stored it returned; a claimed job whose worker
-disappears is re-queued when its lease expires; completion is idempotent and also accepted late; attempts are bounded.
+
+FENCING (Order 11): every claim gets a globally unique, never-reused fencing token (HINCRBY stats fence_seq). Renew,
+complete and fail must present (worker, fence); a report from an older claim is rejected as 'stale' and has NO side
+effects. COMPLETE and FAIL also perform the shared-cache write INSIDE the same Lua script (cache keys are declared in
+KEYS), so "ownership verified", "result stored" and "job marked done" are one atomic step:
+  * a stale worker can neither overwrite another worker's transcript nor write a negative entry;
+  * a retry of the SAME claim after a lost reply returns 'already_completed' (idempotent);
+  * negative cache entries use SET NX and can never replace an existing entry.
+Other guarantees: a job is acknowledged only after the EVAL that stored it returned; a claimed job whose worker
+disappears is re-queued when its lease expires; attempts are bounded.
 """
 from __future__ import annotations
 
@@ -63,6 +71,7 @@ class QueueConfig:
     max_age_days: int = 7
     retention_days: int = 14
     max_pending: int = 2000
+    max_enqueue_per_day: int = 500        # global anti-flood cap on NEW jobs per UTC day
     claim_max: int = 5
     storage_limit_mb: int = 256
     prefix: str = "yt:"
@@ -80,6 +89,7 @@ class QueueConfig:
                    max_age_days=_int(e.get("QUEUE_JOB_MAX_AGE_DAYS"), 7),
                    retention_days=_int(e.get("QUEUE_RETENTION_DAYS"), 14),
                    max_pending=_int(e.get("QUEUE_MAX_PENDING"), 2000),
+                   max_enqueue_per_day=_int(e.get("QUEUE_MAX_ENQUEUE_PER_DAY"), 500),
                    storage_limit_mb=_int(e.get("REMOTE_STORAGE_LIMIT_MB"), 256),
                    prefix=e.get("REMOTE_CACHE_PREFIX", "yt:"))
 
@@ -131,11 +141,15 @@ local function terminal(jid, t, cls, now, msg)
   redis.call('ZREM', KEYS[2], jid); redis.call('ZREM', KEYS[3], jid)
   redis.call('ZADD', KEYS[5], now, jid)
   move(old, 'failed'); cnt('failed_total', 1)
+  if cls == 'expired' then cnt('expired_total', 1); cnt('expired_d:' .. math.floor(now / 86400), 1) end
 end
+local function fresh(t, i) return t[i] or '' end
 """
 
 ENQUEUE = _PRELUDE + """
-local jid, video, lang, now, force, maxpending = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), ARGV[5], tonumber(ARGV[6])
+local jid, video, lang, now, force = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), ARGV[5]
+local maxpending, maxperday = tonumber(ARGV[6]), tonumber(ARGV[7])
+local day = math.floor(now / 86400)
 local cur = redis.call('HGET', KEYS[1], jid)
 local old = nil
 if cur then
@@ -145,10 +159,11 @@ if cur then
   if old == 'failed' and force ~= '1' then return {'failed', t[10]} end
 end
 if redis.call('ZCARD', KEYS[2]) >= maxpending then cnt('rejected_full', 1); return {'full'} end
+if tonumber(redis.call('HGET', KEYS[4], 'enq_d:' .. day) or '0') >= maxperday then cnt('rejected_daily', 1); return {'daily_limit'} end
 if old == 'failed' then redis.call('ZREM', KEYS[5], jid) end
-redis.call('HSET', KEYS[1], jid, join({'pending', video, lang, '0', '0', tostring(now), tostring(now), '', '0', '', '', tostring(now)}))
+redis.call('HSET', KEYS[1], jid, join({'pending', video, lang, '0', '0', tostring(now), tostring(now), '', '0', '', '', tostring(now), '0', ''}))
 redis.call('ZADD', KEYS[2], now, jid)
-move(old, 'pending'); cnt('created', 1)
+move(old, 'pending'); cnt('created', 1); cnt('enq_d:' .. day, 1)
 return {'created'}
 """
 
@@ -185,11 +200,12 @@ for _, jid in ipairs(ids) do
     if now - tonumber(t[6]) > maxage then terminal(jid, t, 'expired', now, '')
     else
       local old = t[1]
+      local fence = redis.call('HINCRBY', KEYS[4], 'fence_seq', 1)
       t[1] = 'processing'; t[4] = tostring(tonumber(t[4]) + 1); t[7] = tostring(now); t[8] = worker
-      t[9] = tostring(now + lease); t[12] = '0'
+      t[9] = tostring(now + lease); t[12] = '0'; t[13] = tostring(fence); t[14] = worker
       redis.call('HSET', KEYS[1], jid, join(t)); redis.call('ZADD', KEYS[3], now + lease, jid)
       move(old, 'processing'); cnt('claims', 1)
-      out[#out + 1] = {jid, t[2], t[3], t[4], t[9]}
+      out[#out + 1] = {jid, t[2], t[3], t[4], t[9], tostring(fence)}
     end
   end
 end
@@ -197,11 +213,11 @@ return out
 """
 
 RENEW = _PRELUDE + """
-local jid, worker, now, lease = ARGV[1], ARGV[2], tonumber(ARGV[3]), tonumber(ARGV[4])
+local jid, worker, fence, now, lease = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5])
 local rec = redis.call('HGET', KEYS[1], jid)
 if not rec then return {'unknown'} end
 local t = split(rec)
-if t[1] ~= 'processing' or t[8] ~= worker then return {'lost', t[1]} end
+if t[1] ~= 'processing' or t[8] ~= worker or t[13] ~= fence then return {'lost', t[1]} end
 t[9] = tostring(now + lease); t[7] = tostring(now)
 redis.call('HSET', KEYS[1], jid, join(t)); redis.call('ZADD', KEYS[3], now + lease, jid)
 cnt('renewals', 1)
@@ -209,34 +225,48 @@ return {'renewed', t[9]}
 """
 
 COMPLETE = _PRELUDE + """
-local jid, worker, now = ARGV[1], ARGV[2], tonumber(ARGV[3])
+-- KEYS 6/7 = cache keys to write (7 may equal 6), KEYS 8 = storage accounting hash
+local jid, worker, fence, now = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4])
+local value, ttl, dayfield, size, second = ARGV[5], tonumber(ARGV[6]), ARGV[7], ARGV[8], ARGV[9]
 local rec = redis.call('HGET', KEYS[1], jid)
 if not rec then return {'unknown'} end
 local t = split(rec)
 local old = t[1]
+if t[13] ~= fence or t[14] ~= worker then cnt('stale_rejected', 1); return {'stale', old} end
 if old == 'completed' then cnt('dup_completions', 1); return {'already_completed'} end
-local late = (old ~= 'processing' or t[8] ~= worker)
+if old == 'failed' then cnt('stale_rejected', 1); return {'stale', 'failed'} end
+local late = (old ~= 'processing')
+redis.call('SET', KEYS[6], value, 'EX', ttl)
+if second == '1' then redis.call('SET', KEYS[7], value, 'EX', ttl) end
+redis.call('HINCRBY', KEYS[8], dayfield, size); redis.call('EXPIRE', KEYS[8], 3024000)
 t[1] = 'completed'; t[7] = tostring(now); t[8] = worker; t[9] = '0'; t[10] = ''; t[11] = ''
 redis.call('HSET', KEYS[1], jid, join(t))
 redis.call('ZREM', KEYS[2], jid); redis.call('ZREM', KEYS[3], jid); redis.call('ZADD', KEYS[5], now, jid)
-move(old, 'completed'); cnt('completed_total', 1)
+move(old, 'completed'); cnt('completed_total', 1); cnt('completed_d:' .. math.floor(now / 86400), 1)
 if late then cnt('late_completions', 1); return {'completed_late'} end
 return {'completed'}
 """
 
 FAIL = _PRELUDE + """
-local jid, worker, now, kind, cls, msg = ARGV[1], ARGV[2], tonumber(ARGV[3]), ARGV[4], ARGV[5], ARGV[6]
-local maxatt, dbase, dmax, maxage = tonumber(ARGV[7]), tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10])
-local rbase = tonumber(ARGV[11])
+-- KEYS 6 = negative cache key (written ONLY for an accepted definitive failure, and only if absent), KEYS 8 = accounting
+local jid, worker, fence, now, kind, cls, msg = ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), ARGV[5], ARGV[6], ARGV[7]
+local maxatt, dbase, dmax, maxage, rbase = tonumber(ARGV[8]), tonumber(ARGV[9]), tonumber(ARGV[10]), tonumber(ARGV[11]), tonumber(ARGV[12])
+local negvalue, negttl, dayfield, size = ARGV[13], tonumber(ARGV[14]), ARGV[15], ARGV[16]
 local rec = redis.call('HGET', KEYS[1], jid)
 if not rec then return {'unknown'} end
 local t = split(rec)
-if t[1] ~= 'processing' or t[8] ~= worker then return {'stale', t[1]} end
+if t[1] ~= 'processing' or t[8] ~= worker or t[13] ~= fence or t[14] ~= worker then cnt('stale_rejected', 1); return {'stale', t[1]} end
 redis.call('ZREM', KEYS[3], jid)
 local att = tonumber(t[4])
 t[7] = tostring(now); t[8] = ''; t[9] = '0'; t[10] = cls; t[11] = msg
 local expired = (now - tonumber(t[6])) > maxage
-if kind == 'definitive' then terminal(jid, t, cls, now, msg); return {'failed'} end
+if kind == 'definitive' then
+  terminal(jid, t, cls, now, msg)
+  if negvalue ~= '' and redis.call('SET', KEYS[6], negvalue, 'EX', negttl, 'NX') then
+    redis.call('HINCRBY', KEYS[8], dayfield, size); redis.call('EXPIRE', KEYS[8], 3024000)
+  end
+  return {'failed'}
+end
 if expired then terminal(jid, t, 'expired', now, msg); return {'failed'} end
 local nb
 if kind == 'interrupted' then
@@ -263,6 +293,10 @@ for _, jid in ipairs(old) do
   if rec then move(split(rec)[1], nil) end
   redis.call('HDEL', KEYS[1], jid); redis.call('ZREM', KEYS[5], jid)
 end
+local d = math.floor(now / 86400) - 16
+for _, p in ipairs({'completed_d:', 'expired_d:', 'enq_d:'}) do
+  redis.call('HDEL', KEYS[4], p .. d, p .. (d - 1))
+end
 return #old
 """
 
@@ -271,12 +305,12 @@ def _parse_record(raw: Optional[str]) -> Optional[dict]:
     if not raw:
         return None
     t = raw.split("|")
-    if len(t) < 12:
+    if len(t) < 14:
         return None
     return {"status": t[0], "video_id": t[1], "language": t[2], "attempts": int(t[3]), "defers": int(t[4]),
             "created": int(float(t[5])), "updated": int(float(t[6])), "owner": t[7] or None,
             "lease_until": int(float(t[8])) or None, "fail_class": t[9] or None, "message": t[10] or None,
-            "not_before": int(float(t[11]))}
+            "not_before": int(float(t[11])), "fence": int(float(t[12] or 0)), "claimed_by": t[13] or None}
 
 
 class JobQueue:
@@ -287,8 +321,9 @@ class JobQueue:
         self._last_prune = 0.0
 
     # ── plumbing ──
-    def _eval_cmd(self, script: str, args: list) -> list:
-        return ["EVAL", script, len(self.keys), *self.keys, *[str(a) for a in args]]
+    def _eval_cmd(self, script: str, args: list, extra_keys: tuple = ()) -> list:
+        keys = [*self.keys, *extra_keys]
+        return ["EVAL", script, len(keys), *keys, *[str(a) for a in args]]
 
     async def _run(self, commands: list) -> list:
         try:
@@ -307,7 +342,8 @@ class JobQueue:
         """items: [(video_id, language)] -> [{'state': ..}] in the same order. Raises QueueUnavailable BEFORE any
         acknowledgement if the store is unreachable."""
         now = self._now()
-        cmds = [self._eval_cmd(ENQUEUE, [job_id(v, l), v, l, now, "1" if force else "0", self.cfg.max_pending]) for v, l in items]
+        cmds = [self._eval_cmd(ENQUEUE, [job_id(v, l), v, l, now, "1" if force else "0", self.cfg.max_pending,
+                                              self.cfg.max_enqueue_per_day]) for v, l in items]
         res = await self._run(cmds)
         out = []
         for (v, l), r in zip(items, res):
@@ -329,23 +365,40 @@ class JobQueue:
         n = max(1, min(self.cfg.claim_max, int(max_jobs)))
         res = await self._run([self._eval_cmd(CLAIM, [now, self.clamp_lease(lease_seconds), worker, n, self.cfg.max_attempts,
                                                       self.cfg.requeue_base, self.cfg.max_age_days * 86400])])
-        return [{"job_id": j[0], "video_id": j[1], "language": j[2], "attempt": int(j[3]), "lease_until": int(float(j[4]))}
-                for j in (res[0] or [])]
+        return [{"job_id": j[0], "video_id": j[1], "language": j[2], "attempt": int(j[3]), "lease_until": int(float(j[4])),
+                 "fence": int(j[5])} for j in (res[0] or [])]
 
-    async def renew(self, jid: str, worker: str, lease_seconds: Optional[int] = None) -> dict:
-        r = (await self._run([self._eval_cmd(RENEW, [jid, worker, self._now(), self.clamp_lease(lease_seconds)])]))[0]
+    async def renew(self, jid: str, worker: str, fence: int, lease_seconds: Optional[int] = None) -> dict:
+        r = (await self._run([self._eval_cmd(RENEW, [jid, worker, fence, self._now(), self.clamp_lease(lease_seconds)])]))[0]
         return {"renewed": r[0] == "renewed", "state": r[0], **({"lease_until": int(float(r[1]))} if r[0] == "renewed" else {})}
 
-    async def complete(self, jid: str, worker: str) -> str:
-        return (await self._run([self._eval_cmd(COMPLETE, [jid, worker, self._now()])]))[0][0]
+    def _day_field(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
 
-    async def fail(self, jid: str, worker: str, error_class: str, message: str = "") -> dict:
+    async def complete(self, jid: str, worker: str, fence: int, cache_keys: list, value: str, ttl: int) -> str:
+        """Atomically: verify (worker, fence) still own the job, store `value` under the cache key(s), mark completed.
+        Returns completed | completed_late | already_completed | stale | unknown. `stale` stores NOTHING."""
+        k1 = cache_keys[0]
+        k2 = cache_keys[1] if len(cache_keys) > 1 else cache_keys[0]
+        cw = f"{self.cfg.prefix}cw"
+        r = await self._run([self._eval_cmd(COMPLETE, [jid, worker, fence, self._now(), value, max(int(ttl), 1), self._day_field(),
+                                                       len(value) * (2 if k2 != k1 else 1), "1" if k2 != k1 else "0"],
+                                            extra_keys=(k1, k2, cw))])
+        return r[0][0]
+
+    async def fail(self, jid: str, worker: str, fence: int, error_class: str, message: str = "",
+                   negative: Optional[tuple] = None) -> dict:
+        """negative = (cache_key, encoded_value, ttl) is written atomically, only for an ACCEPTED definitive failure,
+        and never over an existing cache entry (SET NX)."""
         if not ERROR_CLASS_RE.match(error_class or ""):
             error_class = "unknown_error"
         c = self.cfg
-        r = (await self._run([self._eval_cmd(FAIL, [jid, worker, self._now(), kind_for(error_class), error_class,
-                                                    sanitize_message(message), c.max_attempts, c.defer_base, c.defer_max,
-                                                    c.max_age_days * 86400, c.requeue_base])]))[0]
+        kind = kind_for(error_class)
+        nk, nv, nttl = negative if (negative and kind == "definitive") else (f"{self.cfg.prefix}q:unused", "", 1)
+        cw = f"{self.cfg.prefix}cw"
+        r = (await self._run([self._eval_cmd(FAIL, [jid, worker, fence, self._now(), kind, error_class, sanitize_message(message),
+                                                    c.max_attempts, c.defer_base, c.defer_max, c.max_age_days * 86400, c.requeue_base,
+                                                    nv, max(int(nttl), 1), self._day_field(), len(nv)], extra_keys=(nk, nk, cw))]))[0]
         return {"state": r[0], **({"retry_at": int(float(r[1]))} if len(r) > 1 and r[0] in ("pending", "deferred") else {})}
 
     async def prune(self) -> int:
@@ -378,7 +431,22 @@ class JobQueue:
         oldest_age = None
         if isinstance(oldest, list) and len(oldest) == 2:
             oldest_age = max(0, now - int(float(oldest[1])))
+        day = now // 86400
+        done3 = [int(st.get(f"completed_d:{day - i}", 0)) for i in range(3)]
         return {"pending_total": int(z), "ready_now": int(ready), "deferred_or_waiting": int(z) - int(ready),
+                "completed_today": done3[0], "completed_last_3_days": sum(done3),
+                "expired_total": n("expired_total"), "expired_today": int(st.get(f"expired_d:{day}", 0)),
+                "enqueued_today": int(st.get(f"enq_d:{day}", 0)),
+                "estimated_drain_days": (round(int(z) / (sum(done3) / 3), 1) if sum(done3) > 0 else None),
                 "processing": int(lease), "completed_retained": n("n:completed"), "failed_retained": n("n:failed"),
                 "oldest_pending_age_seconds": oldest_age, "records_retained": int(done),
                 "counters": {k: int(v) for k, v in st.items() if not k.startswith("n:")}}
+
+
+    async def recent_finished(self, n: int = 100) -> list:
+        """Most recently finished (completed/failed) job records, newest first. Used to list expired/failed jobs."""
+        ids = (await self._run([["ZREVRANGE", self.keys[4], 0, max(1, min(n, 200)) - 1]]))[0] or []
+        if not ids:
+            return []
+        recs = await self.get_many(list(ids))
+        return [{"job_id": j, **r} for j, r in recs.items() if r]

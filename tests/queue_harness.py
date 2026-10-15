@@ -19,6 +19,7 @@ from tests.helpers import Clock, FakeLibrary, good_data  # noqa: E402
 from tests.redis_fake import RedisBackedUpstash, make_remote  # noqa: E402
 
 WORKER_TOKEN = "w" * 40
+MCP_TOKEN = "m" * 40
 VID = lambda i: f"vid{i:08d}"[-11:]
 
 
@@ -28,9 +29,11 @@ class Stack:
     def __init__(self, monkeypatch, env=None, fake=None, clock=None):
         self.mp, self.clock = monkeypatch, clock or Clock()
         self.fake = fake or RedisBackedUpstash()
-        self.env = {"TRANSCRIPT_QUEUE_ENABLED": "true", "TRANSCRIPT_CACHE_PATH": ":memory:", "TRANSCRIPT_RETRIES": "0",
-                    "TRANSCRIPT_QUEUE_WAIT_SECONDS": "0", "TRANSCRIPT_FETCHES_PER_MINUTE": "100000", **(env or {})}
+        self.env = {k: v for k, v in {"TRANSCRIPT_QUEUE_ENABLED": "true", "TRANSCRIPT_CACHE_PATH": ":memory:", "TRANSCRIPT_RETRIES": "0",
+                    "TRANSCRIPT_QUEUE_WAIT_SECONDS": "0", "TRANSCRIPT_FETCHES_PER_MINUTE": "100000", **(env or {})}.items() if not k.startswith("_")}
         self.mp.setenv("WORKER_AUTH_TOKEN", WORKER_TOKEN)
+        if (env or {}).get("_no_mcp_auth") != "1":
+            self.mp.setenv("MCP_AUTH_TOKEN", MCP_TOKEN)           # the queue is fail-closed without authenticated MCP
         self.mp.setenv("WORKER_RATE_LIMIT_PER_MINUTE", "100000")
         self.mp.setenv("RATE_LIMIT_PER_MINUTE", "0")
         self.paid_calls = 0

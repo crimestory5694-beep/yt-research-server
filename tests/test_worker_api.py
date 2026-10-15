@@ -2,9 +2,10 @@
 import pytest
 from starlette.testclient import TestClient
 
-from tests.queue_harness import Stack, WORKER_TOKEN, make_result, main, VID
+from tests.queue_harness import Stack, WORKER_TOKEN, MCP_TOKEN, make_result, main, VID
 
 H = {"Authorization": f"Bearer {WORKER_TOKEN}"}
+MH = {"Authorization": f"Bearer {MCP_TOKEN}"}
 
 
 @pytest.fixture
@@ -84,10 +85,10 @@ def test_job_and_result_paths_are_validated(stack):
     assert c.get("/worker/jobs/aaaaaaaaaaa:en", headers=H).status_code == 404
 
 
-def _complete_body(job_id, **over):
+def _complete_body(job, **over):
     r = make_result(25)
     r.update(over)
-    return {"worker_id": "laptop-1", "job_id": job_id, "result": r}
+    return {"worker_id": "laptop-1", "job_id": job["job_id"], "fence": job["fence"], "result": r}
 
 
 def test_complete_validation(stack):
@@ -96,11 +97,10 @@ def test_complete_validation(stack):
     for bad in ({"full_transcript": "short"}, {"source": "supadata"}, {"language_code": "english!!"},
                 {"caption_type": "weird"}, {"segments": [{"text": "x", "start": -1, "duration": 1}]},
                 {"full_transcript": "x" * 3_000_001}):
-        r = c.post("/worker/complete", json=_complete_body(j["job_id"], **bad), headers=H)
+        r = c.post("/worker/complete", json=_complete_body(j, **bad), headers=H)
         assert r.status_code in (413, 422), bad.keys()
-    assert (await_state := stack.svc.queue) is not None
-    assert c.post("/worker/complete", json=_complete_body("zzzzzzzzzzz:en"), headers=H).status_code == 404
-    assert c.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "error_class": "Bad Class!"}, headers=H).status_code == 422
+        assert c.post("/worker/complete", json=_complete_body({"job_id": "zzzzzzzzzzz:en", "fence": 1}), headers=H).status_code == 404
+    assert c.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "fence": j["fence"], "error_class": "Bad Class!"}, headers=H).status_code == 422
 
 
 def test_oversized_body_is_rejected_before_parsing(stack):
@@ -115,11 +115,11 @@ def test_full_lifecycle_claim_renew_complete_then_read_back(stack):
     jobs = claim(stack, n=2).json()["jobs"]
     assert {j["video_id"] for j in jobs} == {VID(1), VID(2)}
     j = jobs[0]
-    assert stack.client.post("/worker/renew", json={"worker_id": "laptop-1", "job_id": j["job_id"], "lease_seconds": 300}, headers=H).json()["renewed"] is True
+    assert stack.client.post("/worker/renew", json={"worker_id": "laptop-1", "job_id": j["job_id"], "fence": j["fence"], "lease_seconds": 300}, headers=H).json()["renewed"] is True
     assert stack.client.get("/worker/result/" + j["video_id"], headers=H).status_code == 404            # not done yet
-    r = stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H)
+    r = stack.client.post("/worker/complete", json=_complete_body(j), headers=H)
     assert r.status_code == 200 and r.json()["state"] == "completed"
-    assert stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H).json()["state"] == "already_completed"
+    assert stack.client.post("/worker/complete", json=_complete_body(j), headers=H).json()["state"] == "already_completed"
     got = stack.client.get("/worker/result/" + j["video_id"], headers=H).json()
     assert got["status"] == "ok" and got["cached"] is True and got["total_segments"] > 200 and len(got["segments"]) == 200
     st = stack.client.get("/worker/jobs/" + j["job_id"], headers=H).json()
@@ -129,7 +129,7 @@ def test_full_lifecycle_claim_renew_complete_then_read_back(stack):
 def test_synchronous_tool_serves_worker_result_from_cache(stack):
     import asyncio
     enqueue(stack, [VID(3)]); (j,) = claim(stack).json()["jobs"]
-    stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H)
+    stack.client.post("/worker/complete", json=_complete_body(j), headers=H)
     res = asyncio.run(main.tool_get_video_transcript(VID(3), "en"))
     assert res["status"] == "ok" and res["cached"] is True and res["source"] == "youtube-transcript-api"
     # ...and still after a Render restart (state lives in the shared store)
@@ -141,7 +141,7 @@ def test_synchronous_tool_serves_worker_result_from_cache(stack):
 def test_definitive_failure_writes_negative_cache_and_blocks_retries(stack):
     import asyncio
     enqueue(stack, [VID(4)]); (j,) = claim(stack).json()["jobs"]
-    r = stack.client.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "error_class": "no_captions", "message": "disabled"}, headers=H)
+    r = stack.client.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "fence": j["fence"], "error_class": "no_captions", "message": "disabled"}, headers=H)
     assert r.json()["state"] == "failed"
     assert asyncio.run(main.tool_get_video_transcript(VID(4), "en"))["status"] == "no_captions"
     assert enqueue(stack, [VID(4)])["results"][0]["state"] in ("failed", "cached")
@@ -149,7 +149,7 @@ def test_definitive_failure_writes_negative_cache_and_blocks_retries(stack):
 
 def test_blocked_report_defers_job(stack):
     enqueue(stack, [VID(5)]); (j,) = claim(stack).json()["jobs"]
-    r = stack.client.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "error_class": "blocked", "message": "bot"}, headers=H).json()
+    r = stack.client.post("/worker/fail", json={"worker_id": "laptop-1", "job_id": j["job_id"], "fence": j["fence"], "error_class": "blocked", "message": "bot"}, headers=H).json()
     assert r["state"] == "deferred" and r["retry_at"] > stack.clock()
     assert claim(stack).json()["jobs"] == []
 
@@ -158,23 +158,23 @@ def test_complete_is_not_acknowledged_if_shared_store_cannot_persist(stack):
     enqueue(stack, [VID(6)]); (j,) = claim(stack).json()["jobs"]
     stack.fake.down = True
     stack.svc.remote._open_until = 0
-    r = stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H)
+    r = stack.client.post("/worker/complete", json=_complete_body(j), headers=H)
     assert r.status_code == 503
     stack.fake.down = False; stack.svc.remote._open_until = 0
     assert stack.client.get("/worker/jobs/" + j["job_id"], headers=H).json()["status"] == "processing"   # not marked done
-    assert stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H).json()["state"] == "completed"
+    assert stack.client.post("/worker/complete", json=_complete_body(j), headers=H).json()["state"] == "completed"
 
 
 def test_queue_disabled_returns_503(monkeypatch):
     s = Stack(monkeypatch, env={"TRANSCRIPT_QUEUE_ENABLED": "false"})
     c = TestClient(main.app, raise_server_exceptions=False)
     assert c.post("/worker/claim", json={"worker_id": "laptop-1"}, headers=H).status_code == 503
-    assert [t["name"] for t in c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]].__len__() == 9
+    assert [t["name"] for t in c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=MH).json()["result"]["tools"]].__len__() == 9
 
 
 # ── MCP tools ──
 def test_queue_tools_appear_only_when_enabled_and_original_nine_are_untouched(stack, monkeypatch):
-    names = [t["name"] for t in stack.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]]
+    names = [t["name"] for t in stack.client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=MH).json()["result"]["tools"]]
     assert names[:9] == [t["name"] for t in main.TOOLS] and names[9:] == ["yt_queue_transcripts", "yt_transcript_queue_status"]
 
 
@@ -203,7 +203,7 @@ def test_status_tool_reports_progress_and_readiness(stack):
     import asyncio
     enqueue(stack, [VID(1), VID(2), VID(3)])
     (j,) = claim(stack).json()["jobs"]
-    stack.client.post("/worker/complete", json=_complete_body(j["job_id"]), headers=H)
+    stack.client.post("/worker/complete", json=_complete_body(j), headers=H)
     st = asyncio.run(main.tool_transcript_queue_status([VID(1), VID(2), VID(3), VID(9)]))
     by = {v["video_id"]: v for v in st["videos"]}
     assert st["queue"]["pending_total"] == 2 and st["queue"]["completed_retained"] == 1

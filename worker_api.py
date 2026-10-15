@@ -29,6 +29,7 @@ class ClaimIn(BaseModel):
 class RenewIn(BaseModel):
     worker_id: str = Field(pattern=WORKER_ID_PATTERN)
     job_id: str = Field(pattern=JOB_PATTERN)
+    fence: int = Field(ge=1, le=2 ** 53)
     lease_seconds: int = Field(300, ge=60, le=900)
 
 
@@ -57,12 +58,14 @@ class ResultIn(BaseModel):
 class CompleteIn(BaseModel):
     worker_id: str = Field(pattern=WORKER_ID_PATTERN)
     job_id: str = Field(pattern=JOB_PATTERN)
+    fence: int = Field(ge=1, le=2 ** 53)           # fencing token returned by /claim for THIS claim
     result: ResultIn
 
 
 class FailIn(BaseModel):
     worker_id: str = Field(pattern=WORKER_ID_PATTERN)
     job_id: str = Field(pattern=JOB_PATTERN)
+    fence: int = Field(ge=1, le=2 ** 53)
     error_class: str = Field(pattern=r"^[a-z][a-z_:]{2,40}$")
     message: str = Field("", max_length=200)
 
@@ -82,7 +85,7 @@ def build_router(get_service: Callable) -> APIRouter:
     def queue_or_503():
         svc = get_service()
         if svc.queue is None:
-            raise HTTPException(503, detail="queue_disabled")
+            raise HTTPException(503, detail="queue_disabled:" + str(svc.queue_block_reason()))
         return svc
 
     @r.get("/ping")
@@ -104,42 +107,53 @@ def build_router(get_service: Callable) -> APIRouter:
     async def renew(body: RenewIn):
         svc = queue_or_503()
         try:
-            return await svc.queue.renew(body.job_id, body.worker_id, body.lease_seconds)
+            return await svc.queue.renew(body.job_id, body.worker_id, body.fence, body.lease_seconds)
         except QueueUnavailable:
             return _err(503, "queue_unavailable")
 
     @r.post("/complete")
     async def complete(body: CompleteIn):
+        """Ownership check, shared-cache write and job completion happen in ONE atomic Redis script. A report from a
+        stale claim (older fencing token / other worker) is rejected with 409 and stores nothing. Success (200) is returned
+        only after the transcript is durably stored AND associated with the authorized job."""
         svc = queue_or_503()
         vid, lang = split_job_id(body.job_id)
-        try:
-            rec = (await svc.queue.get_many([body.job_id])).get(body.job_id)
-        except QueueUnavailable:
-            return _err(503, "queue_unavailable")
-        if rec is None:
-            return _err(404, "unknown_job")
         res = body.result.model_dump()
         res["segments"] = res["segments"][: svc.cfg.max_segments_returned]
         res["total_segments"] = max(body.result.total_segments, len(body.result.segments))
-        # 1) persist the transcript in the shared store FIRST; 2) only then mark the job completed.
-        if not await svc.store_external_result(vid, lang, res, body.result.source):
-            return _err(503, "cache_persist_failed")   # job stays leased/pending -> retried; nothing acknowledged
+        prep = svc.prepare_external_result(vid, lang, res, body.result.source)
+        if prep is None:
+            return _err(503, "shared_store_unavailable_or_value_too_large")
         try:
-            state = await svc.queue.complete(body.job_id, body.worker_id)
+            state = await svc.queue.complete(body.job_id, body.worker_id, body.fence, prep["redis_keys"], prep["value"], prep["ttl"])
         except QueueUnavailable:
-            return _err(503, "queue_unavailable")      # transcript is cached; worker will retry the (idempotent) call
-        return {"state": state}
+            return _err(503, "queue_unavailable")      # nothing acknowledged; the worker keeps the result and retries
+        if state in ("completed", "completed_late", "already_completed"):
+            svc.commit_external_local(prep)
+            return {"state": state}
+        if state == "unknown":
+            return _err(404, "unknown_job")
+        return _err(409, "stale_job", detail=state)    # someone else owns / finished it: discard, do not retry
 
     @r.post("/fail")
     async def fail(body: FailIn):
         svc = queue_or_503()
         vid, lang = split_job_id(body.job_id)
+        prep = None
         if kind_for(body.error_class) == "definitive":
-            await svc.store_external_negative(vid, lang, body.error_class, body.message or body.error_class)
+            prep = svc.prepare_external_negative(vid, lang, body.error_class, body.message or body.error_class)
+        negative = (prep["redis_keys"][0], prep["value"], prep["ttl"]) if prep else None
         try:
-            return await svc.queue.fail(body.job_id, body.worker_id, body.error_class, body.message)
+            out = await svc.queue.fail(body.job_id, body.worker_id, body.fence, body.error_class, body.message, negative)
         except QueueUnavailable:
             return _err(503, "queue_unavailable")
+        if out["state"] == "stale":
+            return _err(409, "stale_job")              # nothing was written anywhere
+        if out["state"] == "unknown":
+            return _err(404, "unknown_job")
+        if out["state"] == "failed" and prep:
+            svc.commit_external_local(prep, "negative")
+        return out
 
     @r.get("/jobs/{job_id}")
     async def job(job_id: str):

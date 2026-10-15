@@ -79,7 +79,7 @@ async def test_claim_respects_not_before():
     q, f, clock = mk()
     await q.enqueue(A, "en")
     (j,) = await q.claim("w1", 1, 300)
-    await q.fail(j["job_id"], "w1", "network_error", "x")            # transient -> backoff
+    await q.fail(j["job_id"], "w1", j["fence"], "network_error", "x")            # transient -> backoff
     assert await q.claim("w1", 1, 300) == []
     clock.advance(61)
     assert len(await q.claim("w1", 1, 300)) == 1
@@ -91,10 +91,10 @@ async def test_lease_renewal_extends_and_only_owner_can_renew():
     await q.enqueue(A, "en")
     (j,) = await q.claim("w1", 1, 120)
     clock.advance(100)
-    r = await q.renew(j["job_id"], "w1", 120)
+    r = await q.renew(j["job_id"], "w1", j["fence"], 120)
     assert r["renewed"] and r["lease_until"] == int(clock()) + 120
-    assert (await q.renew(j["job_id"], "w2", 120))["renewed"] is False
-    assert (await q.renew("zzzzzzzzzzz:en", "w1", 120))["state"] == "unknown"
+    assert (await q.renew(j["job_id"], "w2", j["fence"], 120))["renewed"] is False
+    assert (await q.renew("zzzzzzzzzzz:en", "w1", 1, 120))["state"] == "unknown"
 
 
 async def test_expired_lease_is_recovered_requeued_with_backoff_and_attempt_counted():
@@ -110,14 +110,17 @@ async def test_expired_lease_is_recovered_requeued_with_backoff_and_attempt_coun
     assert j["attempt"] == 2 and (await q.summary())["counters"]["lease_recoveries"] == 1
 
 
-async def test_late_completion_after_reclaim_is_idempotent():
+async def test_late_completion_from_superseded_claim_is_rejected_stale():
     q, f, clock = mk()
     await q.enqueue(A, "en")
     (j1,) = await q.claim("w1", 1, 120)
     clock.advance(200); await q.claim("w2", 1, 120); clock.advance(61)
-    await q.claim("w2", 1, 120)                                        # w2 now owns attempt 2
-    assert await q.complete(j1["job_id"], "w1") == "completed_late"    # w1 finally finishes: accepted
-    assert await q.complete(j1["job_id"], "w2") == "already_completed" # w2 finishes too: harmless
+    (j2,) = await q.claim("w2", 1, 120)                                 # w2 now owns attempt 2 (newer fence)
+    assert j2["fence"] > j1["fence"]
+    assert await q.complete(j1["job_id"], "w1", j1["fence"], ["yt:c:k"], "STALE", 100) == "stale"
+    assert f.redis.get("yt:c:k") is None                                 # nothing stored by the stale worker
+    assert await q.complete(j2["job_id"], "w2", j2["fence"], ["yt:c:k"], "GOOD", 100) == "completed"
+    assert f.redis.get("yt:c:k") == "GOOD"
     s = await q.summary()
     assert s["processing"] == 0 and s["completed_retained"] == 1 and s["counters"]["completed_total"] == 1
 
@@ -136,19 +139,19 @@ async def test_poison_job_stops_after_max_attempts_via_lease_expiry():
 async def test_complete_is_idempotent_and_removes_from_queues():
     q, f, _ = mk()
     await q.enqueue(A, "en"); (j,) = await q.claim("w1", 1, 300)
-    assert await q.complete(j["job_id"], "w1") == "completed"
-    assert await q.complete(j["job_id"], "w1") == "already_completed"
+    assert await q.complete(j["job_id"], "w1", j["fence"], ["yt:c:k"], "v", 100) == "completed"
+    assert await q.complete(j["job_id"], "w1", j["fence"], ["yt:c:k"], "v", 100) == "already_completed"
     assert (await q.enqueue(A, "en"))["state"] == "completed"           # re-asking never re-queues
     s = await q.summary()
     assert s["pending_total"] == 0 and s["processing"] == 0
-    assert await q.complete("zzzzzzzzzzz:en", "w1") == "unknown"
+    assert await q.complete("zzzzzzzzzzz:en", "w1", 1, ["yt:c:k"], "v", 100) == "unknown"
 
 
 @pytest.mark.parametrize("cls", ["no_captions", "video_unavailable", "age_restricted", "language_unavailable", "invalid_video_id"])
 async def test_definitive_failures_are_terminal_and_not_retried(cls):
     q, f, clock = mk()
     await q.enqueue(A, "en"); (j,) = await q.claim("w1", 1, 300)
-    assert (await q.fail(j["job_id"], "w1", cls, "x"))["state"] == "failed"
+    assert (await q.fail(j["job_id"], "w1", j["fence"], cls, "x"))["state"] == "failed"
     clock.advance(10 ** 6)
     assert await q.claim("w1", 1, 300) == []
     rec = await status(q, A)
@@ -164,7 +167,7 @@ async def test_blocked_defers_with_exponential_delay_and_does_not_burn_attempts(
     for _ in range(6):                                                   # far more blocks than max_attempts
         clock.advance(30000)
         (j,) = await q.claim("w1", 1, 300)
-        r = await q.fail(j["job_id"], "w1", "blocked", "bot check")
+        r = await q.fail(j["job_id"], "w1", j["fence"], "blocked", "bot check")
         assert r["state"] == "deferred"
         delays.append(r["retry_at"] - int(clock()))
     assert delays == [1800, 3600, 7200, 14400, 21600, 21600]            # doubled, capped
@@ -179,7 +182,7 @@ async def test_transient_failures_retry_with_backoff_then_fail_at_max_attempts()
     for i in range(3):
         clock.advance(5000)
         (j,) = await q.claim("w1", 1, 300)
-        r = await q.fail(j["job_id"], "w1", "timeout", "slow")
+        r = await q.fail(j["job_id"], "w1", j["fence"], "timeout", "slow")
         waits.append(r.get("retry_at", 0) - int(clock()) if r["state"] == "pending" else r["state"])
     assert waits == [60, 120, "failed"]
     rec = await status(q, A)
@@ -189,7 +192,7 @@ async def test_transient_failures_retry_with_backoff_then_fail_at_max_attempts()
 async def test_interrupted_returns_job_immediately_without_consuming_attempt():
     q, f, clock = mk()
     await q.enqueue(A, "en"); (j,) = await q.claim("w1", 1, 300)
-    assert (await q.fail(j["job_id"], "w1", "interrupted", "shutdown"))["state"] == "pending"
+    assert (await q.fail(j["job_id"], "w1", j["fence"], "interrupted", "shutdown"))["state"] == "pending"
     (j2,) = await q.claim("w2", 1, 300)
     assert j2["attempt"] == 1
 
@@ -197,7 +200,7 @@ async def test_interrupted_returns_job_immediately_without_consuming_attempt():
 async def test_stale_failure_report_is_ignored():
     q, f, clock = mk()
     await q.enqueue(A, "en"); (j,) = await q.claim("w1", 1, 300)
-    assert (await q.fail(j["job_id"], "w2", "no_captions", "x"))["state"] == "stale"      # not the owner
+    assert (await q.fail(j["job_id"], "w2", j["fence"], "no_captions", "x"))["state"] == "stale"      # not the owner
     assert (await status(q, A))["status"] == "processing"
 
 
@@ -215,7 +218,7 @@ async def test_prune_removes_old_finished_records_and_keeps_counts_consistent():
     for v in (A, B):
         await q.enqueue(v, "en")
     for j in await q.claim("w1", 2, 300):
-        await q.complete(j["job_id"], "w1")
+        await q.complete(j["job_id"], "w1", j["fence"], ["yt:c:k"], "v", 100)
     await q.enqueue(C, "en")
     clock.advance(2 * 86400)
     assert await q.prune() == 2
@@ -236,7 +239,7 @@ async def test_summary_reports_depth_and_progress():
     q, f, clock = mk()
     await q.enqueue_many([(f"v{i:010d}"[-11:], "en") for i in range(5)])
     js = await q.claim("w1", 2, 300)
-    await q.complete(js[0]["job_id"], "w1"); await q.fail(js[1]["job_id"], "w1", "no_captions", "")
+    await q.complete(js[0]["job_id"], "w1", js[0]["fence"], ["yt:c:k"], "v", 100); await q.fail(js[1]["job_id"], "w1", js[1]["fence"], "no_captions", "")
     clock.advance(30)
     s = await q.summary()
     assert (s["pending_total"], s["ready_now"], s["processing"], s["completed_retained"], s["failed_retained"]) == (3, 3, 0, 1, 1)
@@ -307,7 +310,7 @@ async def test_scripts_only_touch_declared_keys_and_no_cjson():
         assert "cjson" not in src and "redis.call('KEYS'" not in src and "SCAN" not in src
         import re
         used = set(re.findall(r"KEYS\[(\d)\]", src))
-        assert used <= {"1", "2", "3", "4", "5"}
+        assert used <= {"1", "2", "3", "4", "5", "6", "7", "8"}
         for call in re.findall(r"redis\.call\('([A-Z]+)', ([^,)]+)", src):
             assert call[1].startswith("KEYS["), f"{name}: {call} uses an undeclared key"
 

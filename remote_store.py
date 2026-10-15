@@ -106,11 +106,19 @@ class RemoteStore:
         except Exception:
             return None  # corrupt/foreign value = miss
 
-    async def put_cache(self, key: str, payload: dict, kind: str, ttl: int) -> bool:
+    def cache_redis_key(self, key: str) -> str:
+        return f"{self.prefix}c:{key}"
+
+    def prepare_cache_value(self, payload: dict, kind: str) -> Optional[str]:
+        """Encoded value for the cache, or None if it cannot fit (text is kept, timestamps dropped first)."""
         enc = encode_value(kind, payload)
         if len(enc) > MAX_VALUE_BYTES and payload.get("segments"):
-            enc = encode_value(kind, {**payload, "segments": []})  # keep the text, drop timestamps
-        if len(enc) > MAX_VALUE_BYTES:
+            enc = encode_value(kind, {**payload, "segments": []})
+        return enc if len(enc) <= MAX_VALUE_BYTES else None
+
+    async def put_cache(self, key: str, payload: dict, kind: str, ttl: int) -> bool:
+        enc = self.prepare_cache_value(payload, kind)
+        if enc is None:
             return False
         # Storage accounting: bytes written per UTC day in one small hash (35-day expiry). Cache entries live at most
         # ~30 days, so the sum of recent buckets approximates live storage without scanning the keyspace.

@@ -595,10 +595,10 @@ class TranscriptService:
         if self.remote is None and self.cfg.remote_url and self.cfg.remote_token:
             from remote_store import RemoteStore
             self.remote = RemoteStore(self.cfg.remote_url, self.cfg.remote_token, self.cfg.remote_prefix)
-        self.queue = None
+        self._queue = None
         if self.cfg.queue is not None and self.cfg.queue.enabled and self.remote is not None:
             from job_queue import JobQueue
-            self.queue = JobQueue(self.remote, self.cfg.queue, self._clock)
+            self._queue = JobQueue(self.remote, self.cfg.queue, self._clock)
         self._inflight: dict = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._fetch_times: deque = deque()
@@ -678,37 +678,74 @@ class TranscriptService:
             if not fut.done():
                 fut.set_result(payload or self._error_payload(ctx, TranscriptError(UPSTREAM_ERROR, "Request aborted"), []))
 
+    # -- durable queue gate ----------------------------------------------------------------------------
+    def queue_block_reason(self) -> Optional[str]:
+        """Why the queue is unavailable (None = available). The queue is fail-closed: it also requires authenticated MCP
+        access (MCP_AUTH_TOKEN) so anonymous callers can never submit jobs, read job status or fill the queue."""
+        if self.cfg.queue is None or not self.cfg.queue.enabled:
+            return "disabled"
+        if self.remote is None:
+            return "needs_upstash"
+        from security import load_tokens
+        if not load_tokens():
+            return "needs_mcp_auth_token"
+        return None
+
+    @property
+    def queue(self):
+        return self._queue if self.queue_block_reason() is None else None
+
     # -- results produced elsewhere (the local worker) ---------------------------------------------
     @staticmethod
     def _job_languages(language: str) -> tuple:
         """Job language -> (languages list, any_language flag). 'any' = best available track."""
         return (["en"], True) if language == "any" else (parse_languages(language), False)
 
-    async def store_external_result(self, video_id: str, language: str, result: dict, source: str) -> bool:
-        """Persist a transcript fetched by the local worker under the same cache keys the synchronous tool reads.
-        True only if the SHARED store accepted it (the job must not be marked completed otherwise)."""
+    def _external_keys(self, video_id: str, language: str, code: Optional[str]) -> list:
         languages, any_flag = self._job_languages(language)
+        lp = ",".join(l.lower() for l in languages)
+        keys = [f"{video_id}|{lp}|{int(any_flag)}"]
+        if any_flag and code and pick_transcript([(code, False, None)], languages):
+            keys.append(f"{video_id}|{lp}|0")        # the language really matched: strict requests may reuse it
+        return keys
+
+    def prepare_external_result(self, video_id: str, language: str, result: dict, source: str) -> Optional[dict]:
+        """Build (but do NOT write) the cache entry for a transcript produced by the local worker. The write itself happens
+        inside the queue's atomic COMPLETE script, after job ownership (worker + fencing token) has been verified.
+        None if there is no shared store or the value cannot fit."""
+        if self.remote is None:
+            return None
         segs = result.get("segments") or []
         payload = {"status": OK, "video_id": video_id, "language_code": result.get("language_code"),
                    "requested_language": language, "total_segments": result.get("total_segments") or (len(segs) or None),
-                   "full_transcript": result["full_transcript"], "segments": segs,
+                   "full_transcript": result["full_transcript"], "segments": segs[: self.cfg.max_segments_returned],
                    "caption_type": result.get("caption_type", "unknown"),
                    "available_languages": result.get("available_languages", []),
                    "source": source, "proxy_used": False, "attempts": [{"provider": "local_worker", "outcome": OK}]}
-        lp = ",".join(l.lower() for l in languages)
-        now = self._clock()
-        ok = await self._cache_put(f"{video_id}|{lp}|{int(any_flag)}", payload, "positive", self.cfg.cache_ttl_seconds, now)
-        code = payload["language_code"]
-        if any_flag and code and pick_transcript([(code, False, None)], languages):
-            ok = await self._cache_put(f"{video_id}|{lp}|0", payload, "positive", self.cfg.cache_ttl_seconds, now) and ok
-        return ok if self.remote is not None else False
+        value = self.remote.prepare_cache_value(payload, "positive")
+        if value is None:
+            return None
+        keys = self._external_keys(video_id, language, payload["language_code"])
+        return {"payload": payload, "value": value, "ttl": self.cfg.cache_ttl_seconds, "keys": keys,
+                "redis_keys": [self.remote.cache_redis_key(k) for k in keys]}
 
-    async def store_external_negative(self, video_id: str, language: str, status: str, message: str) -> bool:
+    def commit_external_local(self, prep: dict, kind: str = "positive"):
+        """Mirror an ACCEPTED result into this instance's local cache layer (never called for stale reports)."""
+        for k in prep["keys"]:
+            if kind == "positive" or self.store.get(k, self._clock()) is None:    # negatives never replace anything
+                self.store.put(k, prep["payload"], kind, prep["ttl"], self._clock())
+
+    def prepare_external_negative(self, video_id: str, language: str, status: str, message: str) -> Optional[dict]:
+        if self.remote is None:
+            return None
         languages, any_flag = self._job_languages(language)
         payload = self._error_payload(_Ctx(video_id, languages, any_flag, language), TranscriptError(status, message), [])
+        value = self.remote.prepare_cache_value(payload, "negative")
+        if value is None:
+            return None
         ttl = 3600 if status == LANGUAGE_UNAVAILABLE else self.cfg.negative_ttl_seconds
-        lp = ",".join(l.lower() for l in languages)
-        return await self._cache_put(f"{video_id}|{lp}|{int(any_flag)}", payload, "negative", ttl, self._clock())
+        keys = self._external_keys(video_id, language, None)[:1]
+        return {"payload": payload, "value": value, "ttl": ttl, "keys": keys, "redis_keys": [self.remote.cache_redis_key(keys[0])]}
 
     async def cached_result(self, video_id: str, language: str) -> Optional[dict]:
         """Positive cache entry for a job's video/language (presented like a normal tool response) or None."""
@@ -763,6 +800,8 @@ class TranscriptService:
                     elif lim and used is not None and used >= 0.8 * lim:
                         alerts.append(f"paid_{p}_{tag}_cap_80pct")
         queue_info = None
+        if self.cfg.queue is not None and self.cfg.queue.enabled and self.queue_block_reason():
+            alerts.append("queue_blocked_" + self.queue_block_reason())
         if self.queue is not None:
             try:
                 queue_info = await self.queue.summary()

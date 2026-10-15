@@ -123,7 +123,7 @@ def test_slow_extraction_longer_than_lease_with_a_second_worker_is_idempotent(tm
     s = qs._summary()
     assert s["completed_retained"] == 1 and s["processing"] == 0 and s["pending_total"] == 0
     assert ex1.total == 1 and ex2.total == 1                                   # duplicated work happened, results did not
-    assert s["counters"]["completed_total"] == 1 and s["counters"].get("dup_completions", 0) + s["counters"].get("late_completions", 0) >= 1
+    assert s["counters"]["completed_total"] == 1 and s["counters"].get("stale_rejected", 0) >= 1      # w1's late result was fenced off
     qs.close(st)
 
 

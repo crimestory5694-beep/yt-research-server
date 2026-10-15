@@ -221,15 +221,16 @@ class Api:
                                                                 "lease_seconds": self.s.lease_seconds})
         return body.get("jobs", []) if code == 200 else []
 
-    def renew(self, job_id):
-        return self._call("POST", "/worker/renew", json={"worker_id": self.s.worker_id, "job_id": job_id,
+    def renew(self, job_id, fence):
+        return self._call("POST", "/worker/renew", json={"worker_id": self.s.worker_id, "job_id": job_id, "fence": fence,
                                                          "lease_seconds": self.s.lease_seconds}, timeout=30)[1]
 
-    def complete(self, job_id, result):
-        return self._call("POST", "/worker/complete", json={"worker_id": self.s.worker_id, "job_id": job_id, "result": result}, timeout=60)
+    def complete(self, job_id, fence, result):
+        return self._call("POST", "/worker/complete", json={"worker_id": self.s.worker_id, "job_id": job_id, "fence": fence,
+                                                            "result": result}, timeout=60)
 
-    def fail(self, job_id, error_class, message=""):
-        return self._call("POST", "/worker/fail", json={"worker_id": self.s.worker_id, "job_id": job_id,
+    def fail(self, job_id, fence, error_class, message=""):
+        return self._call("POST", "/worker/fail", json={"worker_id": self.s.worker_id, "job_id": job_id, "fence": fence,
                                                         "error_class": error_class, "message": message[:200]}, timeout=60)
 
 
@@ -275,18 +276,18 @@ class Worker:
             return "unknown_error", type(exc).__name__
         return str(cls), str(getattr(exc, "message", ""))[:160]
 
-    def _submit(self, job_id: str, kind: str, payload: dict) -> bool:
+    def _submit(self, job_id: str, fence: int, kind: str, payload: dict) -> bool:
         """Deliver complete/fail; 3 spaced attempts. False = could not deliver (caller keeps it in the outbox)."""
         for i, wait in enumerate((0, 5, 15)):
             if wait and self._sleep(wait) is True and self.stop.is_set():
                 break
             try:
-                code, body = (self.api.complete(job_id, payload) if kind == "complete"
-                              else self.api.fail(job_id, payload["error_class"], payload.get("message", "")))
+                code, body = (self.api.complete(job_id, fence, payload) if kind == "complete"
+                              else self.api.fail(job_id, fence, payload["error_class"], payload.get("message", "")))
                 if code < 400:
                     return True
-                if code in (404, 422):         # job gone / rejected: do not retry forever
-                    log.warning("server rejected %s for %s (HTTP %s)", kind, job_id, code)
+                if code in (404, 409, 422):    # job gone / STALE claim (someone else owns it) / rejected: final, never retried
+                    log.warning("server rejected %s for %s (HTTP %s): discarding local result", kind, job_id, code)
                     return True
             except ServerBusy as e:
                 log.warning("submit %s for %s deferred: %s", kind, job_id, e)
@@ -297,17 +298,17 @@ class Worker:
             if self.stop.is_set():
                 return
             body = item["body"]
-            if self._submit(item["job_id"], body["kind"], body["payload"]):
+            if self._submit(item["job_id"], int(body["fence"]), body["kind"], body["payload"]):
                 self.state.outbox_done(name); self.stats["resubmitted"] += 1
                 log.info("resubmitted stored result for %s", item["job_id"])
             else:
                 return                         # server unreachable: try again next cycle
 
-    def _renewer(self, job_id: str, done: threading.Event):
+    def _renewer(self, job_id: str, fence: int, done: threading.Event):
         interval = self.s.renew_interval or max(20, self.s.lease_seconds // 3)
         while not done.wait(interval):
             try:
-                r = self.api.renew(job_id)
+                r = self.api.renew(job_id, fence)
                 if not r.get("renewed"):
                     log.warning("lease for %s no longer ours (%s); will still try to deliver", job_id, r.get("state"))
                     return
@@ -315,9 +316,9 @@ class Worker:
                 pass
 
     def process(self, job: dict):
-        jid, vid, lang = job["job_id"], job["video_id"], job["language"]
+        jid, vid, lang, fence = job["job_id"], job["video_id"], job["language"], int(job["fence"])
         done = threading.Event()
-        t = threading.Thread(target=self._renewer, args=(jid, done), daemon=True); t.start()
+        t = threading.Thread(target=self._renewer, args=(jid, fence, done), daemon=True); t.start()
         self.state.record_extraction()
         try:
             result = self.extract(vid, lang)
@@ -333,9 +334,9 @@ class Worker:
         elif kind == "complete":
             self.state.note_success()
         log.info("job %s -> %s", jid, payload.get("error_class", "ok") if kind == "fail" else "ok")
-        if not self._submit(jid, kind, payload):
+        if not self._submit(jid, fence, kind, payload):
             try:
-                self.state.outbox_put(jid, {"kind": kind, "payload": payload})
+                self.state.outbox_put(jid, {"kind": kind, "payload": payload, "fence": fence})
                 log.warning("could not deliver result for %s; stored for retry", jid)
             except RuntimeError:
                 log.error("outbox full; dropping local copy of %s (server lease will re-queue it)", jid)

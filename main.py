@@ -14,6 +14,10 @@ from security import SecurityMiddleware
 from worker_api import build_router as build_worker_router
 from job_queue import QueueUnavailable, LANG_RE as _JOB_LANG_RE, VIDEO_RE as _JOB_VIDEO_RE
 
+import logging as _logging
+for _noisy in ("httpx", "httpcore"):     # their INFO lines would print request URLs (e.g. the Upstash host) into the logs
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)
+
 app = FastAPI(title="YouTube Research MCP Server")
 
 # CORS defaults to "*" (previous behaviour). Tighten with CORS_ALLOW_ORIGINS="https://a.com,https://b.com".
@@ -722,8 +726,9 @@ QUEUE_TOOLS = [
         "inputSchema": {"type": "object", "properties": {
             "video_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100, "description": "Video IDs or YouTube URLs"},
             "language": {"type": "string", "default": "en", "description": "One language code, or 'any'"},
-            "retry_failed": {"type": "boolean", "default": False, "description": "Re-open jobs that previously failed"}},
-            "required": ["video_ids"]}
+            "retry_failed": {"type": "boolean", "default": False, "description": "Re-open the listed jobs if they previously failed"},
+            "reopen_expired": {"type": "boolean", "default": False, "description": "Intentionally re-open up to 100 recently EXPIRED jobs (never automatic)"}},
+            "required": []}
     },
     {
         "name": "yt_transcript_queue_status",
@@ -731,7 +736,8 @@ QUEUE_TOOLS = [
                        "'ready' means the transcript can be read now with yt_get_video_transcript.",
         "inputSchema": {"type": "object", "properties": {
             "video_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
-            "language": {"type": "string", "default": "en"}}}
+            "language": {"type": "string", "default": "en"},
+            "show": {"type": "string", "enum": ["failed", "expired"], "description": "List recent failed/expired jobs (<=100)"}}}
     },
 ]
 
@@ -739,26 +745,45 @@ QUEUE_TOOLS = [
 def visible_tools() -> list:
     """The original nine tools; the two queue tools appear only when TRANSCRIPT_QUEUE_ENABLED is set."""
     try:
-        if get_transcript_service().cfg.queue.enabled:
+        if get_transcript_service().queue_block_reason() is None:      # enabled + Upstash + authenticated MCP
             return TOOLS + QUEUE_TOOLS
     except Exception:
         pass
     return TOOLS
 
 
-async def tool_queue_transcripts(video_ids: list, language: str = "en", retry_failed: bool = False) -> dict:
+def _queue_unavailable(svc, extra: Optional[dict] = None) -> dict:
+    why = svc.queue_block_reason()
+    msg = {"disabled": "Durable queue is disabled (TRANSCRIPT_QUEUE_ENABLED).",
+           "needs_upstash": "Durable queue needs an Upstash database (UPSTASH_REDIS_REST_URL/TOKEN).",
+           "needs_mcp_auth_token": "Durable queue requires authenticated MCP access: set MCP_AUTH_TOKEN on the server."}.get(why, "Queue unavailable.")
+    return {"status": "queue_unavailable", "reason": why, "error": msg, "queued": 0, **(extra or {})}
+
+
+async def tool_queue_transcripts(video_ids: Optional[list] = None, language: str = "en", retry_failed: bool = False,
+                                 reopen_expired: bool = False) -> dict:
     from transcript_service import normalize_video_id
     svc = get_transcript_service()
     if svc.queue is None:
-        return {"status": "queue_unavailable", "error": "Durable queue is not configured (needs TRANSCRIPT_QUEUE_ENABLED=true "
-                "and an Upstash database).", "queued": 0}
-    if not isinstance(video_ids, list) or not video_ids or len(video_ids) > 100:
+        return _queue_unavailable(svc)
+    video_ids = list(video_ids or [])
+    if not reopen_expired and (not isinstance(video_ids, list) or not video_ids):
         return {"status": "invalid_request", "error": "video_ids must be a list of 1-100 items", "queued": 0}
-    lang = _norm_job_language(language) if language != "any" else "any"
-    if not lang:
+    if len(video_ids) > 100:
+        return {"status": "invalid_request", "error": "video_ids must be a list of 1-100 items", "queued": 0}
+    lang = (language or "").strip().lower()
+    if lang != "any" and not _JOB_LANG_RE.match(lang):               # strict: exactly one plain language code
         return {"status": "invalid_request", "error": "invalid language", "queued": 0}
     results, todo = [], []
     seen = set()
+    if reopen_expired:                                   # deliberate, bounded, visible: never done automatically
+        try:
+            for rec in await svc.queue.recent_finished(200):
+                if rec["fail_class"] == "expired" and rec["language"] == lang and len(video_ids) < 100:
+                    video_ids.append(rec["video_id"])
+        except QueueUnavailable:
+            return _queue_unavailable(svc, {"error": "Shared store unreachable; nothing was re-opened."})
+        retry_failed = True
     for raw in video_ids:
         vid = normalize_video_id(raw) if isinstance(raw, str) else None
         if vid is None:
@@ -784,17 +809,21 @@ async def tool_queue_transcripts(video_ids: list, language: str = "en", retry_fa
     return {"status": "ok", "language": lang, "summary": counts, "results": results}
 
 
-async def tool_transcript_queue_status(video_ids: Optional[list] = None, language: str = "en") -> dict:
+async def tool_transcript_queue_status(video_ids: Optional[list] = None, language: str = "en", show: Optional[str] = None) -> dict:
     from transcript_service import normalize_video_id
     from job_queue import job_id
     svc = get_transcript_service()
     if svc.queue is None:
-        return {"status": "queue_unavailable", "error": "Durable queue is not configured."}
+        return _queue_unavailable(svc)
     lang = _norm_job_language(language) if language != "any" else "any"
     if not lang:
         return {"status": "invalid_request", "error": "invalid language"}
     try:
         out = {"status": "ok", "queue": await svc.queue.summary()}
+        if show in ("failed", "expired"):
+            rows = [r for r in await svc.queue.recent_finished(200) if r["status"] == "failed"
+                    and (show == "failed" or r["fail_class"] == "expired")][:100]
+            out["jobs"] = [{"video_id": r["video_id"], "language": r["language"], "fail_class": r["fail_class"], "finished": r["updated"]} for r in rows]
         ids = [v for v in ((normalize_video_id(x) if isinstance(x, str) else None) for x in (video_ids or [])[:100]) if v]
         if ids:
             recs = await svc.queue.get_many([job_id(v, lang) for v in ids])

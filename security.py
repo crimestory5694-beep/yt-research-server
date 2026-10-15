@@ -62,7 +62,7 @@ class SlidingWindowLimiter:
 class SecurityMiddleware:
     def __init__(self, app, tokens=None, rate_limit_per_minute: Optional[int] = None, worker_tokens=None):
         self.app = app
-        self.tokens = load_tokens() if tokens is None else tokens
+        self._tokens_override = tokens
         if rate_limit_per_minute is None:
             try:
                 rate_limit_per_minute = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120"))
@@ -75,6 +75,11 @@ class SecurityMiddleware:
             self.worker_max_body = int(os.environ.get("WORKER_MAX_BODY_BYTES", str(4_000_000)))
         except ValueError:
             self.worker_max_body = 4_000_000
+
+    @property
+    def tokens(self) -> list:
+        """MCP tokens: read from the environment on every request unless fixed at construction (tests)."""
+        return load_tokens() if self._tokens_override is None else self._tokens_override
 
     @property
     def auth_enabled(self) -> bool:

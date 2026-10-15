@@ -1,0 +1,5 @@
+# Local Windows worker only (the Render server has its own requirements.txt)
+httpx==0.27.0
+requests==2.34.2
+youtube-transcript-api==1.2.4
+# optional second extractor (set ENABLE_YTDLP=true in worker.env): yt-dlp==2026.8.19

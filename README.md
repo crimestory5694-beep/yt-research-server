@@ -66,6 +66,14 @@ optional proxy -> paid APIs (off by default)**.
   media from YouTube (against its terms for third-party content, and it triggers the same IP blocks), and it cannot run
   on Render Free (0.1 CPU / 512 MB). It is only reasonable for audio you own or are licensed to use, on your own hardware.
 
+## Hybrid queue + local worker (optional, off by default)
+
+Cloud-only extraction is not reliable (YouTube blocks most Render requests). With `TRANSCRIPT_QUEUE_ENABLED=true` and an
+Upstash database, jobs are queued durably and a worker on your Windows laptop (outbound HTTPS only) fetches them from your
+home IP and stores the results in the shared cache. Two extra MCP tools appear (`yt_queue_transcripts`,
+`yt_transcript_queue_status`); the original nine are unchanged. Full guide, install steps and live-test plan:
+**`docs/WORKER_AND_QUEUE.md`**. Offline evidence: `python scripts/queue_sim.py` (bounded, ~20 s) and `pytest`.
+
 ## Authentication & rate limiting (`security.py`)
 
 * `MCP_AUTH_TOKEN` (or comma-separated `MCP_AUTH_TOKENS`) unset -> **open, as before**. Set it to require

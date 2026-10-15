@@ -147,6 +147,7 @@ class TranscriptConfig:
     remote_url: str = ""
     remote_token: str = ""
     remote_prefix: str = "yt:"
+    queue: Any = None          # job_queue.QueueConfig (durable job queue; disabled unless TRANSCRIPT_QUEUE_ENABLED)
     quota_cooldown_seconds: int = 12 * 3600
     auth_cooldown_seconds: int = 24 * 3600
     rate_cooldown_seconds: int = 900
@@ -205,6 +206,7 @@ class TranscriptConfig:
             remote_url=e.get("UPSTASH_REDIS_REST_URL", ""),
             remote_token=e.get("UPSTASH_REDIS_REST_TOKEN", ""),
             remote_prefix=e.get("REMOTE_CACHE_PREFIX", "yt:"),
+            queue=__import__("job_queue").QueueConfig.from_env(e),
         )
 
     def limits_for(self, provider: str) -> tuple:
@@ -593,6 +595,10 @@ class TranscriptService:
         if self.remote is None and self.cfg.remote_url and self.cfg.remote_token:
             from remote_store import RemoteStore
             self.remote = RemoteStore(self.cfg.remote_url, self.cfg.remote_token, self.cfg.remote_prefix)
+        self.queue = None
+        if self.cfg.queue is not None and self.cfg.queue.enabled and self.remote is not None:
+            from job_queue import JobQueue
+            self.queue = JobQueue(self.remote, self.cfg.queue, self._clock)
         self._inflight: dict = {}
         self._sem: Optional[asyncio.Semaphore] = None
         self._fetch_times: deque = deque()
@@ -672,6 +678,48 @@ class TranscriptService:
             if not fut.done():
                 fut.set_result(payload or self._error_payload(ctx, TranscriptError(UPSTREAM_ERROR, "Request aborted"), []))
 
+    # -- results produced elsewhere (the local worker) ---------------------------------------------
+    @staticmethod
+    def _job_languages(language: str) -> tuple:
+        """Job language -> (languages list, any_language flag). 'any' = best available track."""
+        return (["en"], True) if language == "any" else (parse_languages(language), False)
+
+    async def store_external_result(self, video_id: str, language: str, result: dict, source: str) -> bool:
+        """Persist a transcript fetched by the local worker under the same cache keys the synchronous tool reads.
+        True only if the SHARED store accepted it (the job must not be marked completed otherwise)."""
+        languages, any_flag = self._job_languages(language)
+        segs = result.get("segments") or []
+        payload = {"status": OK, "video_id": video_id, "language_code": result.get("language_code"),
+                   "requested_language": language, "total_segments": result.get("total_segments") or (len(segs) or None),
+                   "full_transcript": result["full_transcript"], "segments": segs,
+                   "caption_type": result.get("caption_type", "unknown"),
+                   "available_languages": result.get("available_languages", []),
+                   "source": source, "proxy_used": False, "attempts": [{"provider": "local_worker", "outcome": OK}]}
+        lp = ",".join(l.lower() for l in languages)
+        now = self._clock()
+        ok = await self._cache_put(f"{video_id}|{lp}|{int(any_flag)}", payload, "positive", self.cfg.cache_ttl_seconds, now)
+        code = payload["language_code"]
+        if any_flag and code and pick_transcript([(code, False, None)], languages):
+            ok = await self._cache_put(f"{video_id}|{lp}|0", payload, "positive", self.cfg.cache_ttl_seconds, now) and ok
+        return ok if self.remote is not None else False
+
+    async def store_external_negative(self, video_id: str, language: str, status: str, message: str) -> bool:
+        languages, any_flag = self._job_languages(language)
+        payload = self._error_payload(_Ctx(video_id, languages, any_flag, language), TranscriptError(status, message), [])
+        ttl = 3600 if status == LANGUAGE_UNAVAILABLE else self.cfg.negative_ttl_seconds
+        lp = ",".join(l.lower() for l in languages)
+        return await self._cache_put(f"{video_id}|{lp}|{int(any_flag)}", payload, "negative", ttl, self._clock())
+
+    async def cached_result(self, video_id: str, language: str) -> Optional[dict]:
+        """Positive cache entry for a job's video/language (presented like a normal tool response) or None."""
+        languages, any_flag = self._job_languages(language)
+        lp = ",".join(l.lower() for l in languages)
+        for key in (f"{video_id}|{lp}|0", f"{video_id}|{lp}|1"):
+            hit = await self._cache_get(key)
+            if hit and hit[1] == "positive":
+                return self._present(hit[0], _Ctx(video_id, languages, any_flag, language), cached=True)
+        return None
+
     async def diagnostics(self) -> dict:
         now = self._clock()
         month = time.strftime("%Y-%m", time.gmtime(now))
@@ -714,8 +762,32 @@ class TranscriptService:
                         alerts.append(f"paid_{p}_{tag}_cap_reached")
                     elif lim and used is not None and used >= 0.8 * lim:
                         alerts.append(f"paid_{p}_{tag}_cap_80pct")
+        queue_info = None
+        if self.queue is not None:
+            try:
+                queue_info = await self.queue.summary()
+                if queue_info["pending_total"] >= 0.8 * self.cfg.queue.max_pending:
+                    alerts.append("queue_depth_high")
+                if (queue_info["oldest_pending_age_seconds"] or 0) > 6 * 3600 and queue_info["ready_now"] > 0:
+                    alerts.append("queue_backlog_older_than_6h_worker_offline_or_stalled")
+            except Exception:
+                queue_info = {"available": False}
+                alerts.append("queue_unavailable")
+        storage = None
+        if self.remote is not None:
+            est = await self.remote.storage_estimate()
+            if est is not None:
+                lim = self.cfg.queue.storage_limit_mb * 1_000_000 if self.cfg.queue is not None else 256_000_000
+                frac = est["approx_cache_bytes"] / lim
+                storage = {**est, "limit_mb": lim // 1_000_000, "used_pct": round(100 * frac, 1)}
+                if frac >= 0.9:
+                    alerts.append("remote_storage_90pct")
+                elif frac >= 0.7:
+                    alerts.append("remote_storage_70pct")
         return {
             "alerts": alerts,
+            "job_queue": queue_info,
+            "remote_storage": storage,
             "outcomes_since_start": dict(self._outcomes),
             "block_streaks": dict(self._block_streak),
             "queue": {"waiting": self._waiters, "max": self.cfg.queue_max, "wait_seconds": self.cfg.queue_wait_seconds},
@@ -772,7 +844,7 @@ class TranscriptService:
                 return payload, kind
         return None
 
-    async def _cache_put(self, key: str, payload: dict, kind: str, ttl: int, now: float):
+    async def _cache_put(self, key: str, payload: dict, kind: str, ttl: int, now: float) -> bool:
         # Only the first max_segments_returned segments are ever returned to clients, and the full text is kept
         # separately, so storing every segment would just double the footprint (and the Upstash free-tier usage).
         if payload.get("segments") and len(payload["segments"]) > self.cfg.max_segments_returned:
@@ -784,6 +856,8 @@ class TranscriptService:
         if self.remote is not None:
             if not await self.remote.put_cache(key, payload, kind, ttl):
                 self._alert("remote_store_unavailable", "Shared cache write failed; transcripts are only cached locally")
+                return False
+        return True
 
     async def _cooldown(self, name: str, now: float):
         local = self.store.cooldown(name, now)

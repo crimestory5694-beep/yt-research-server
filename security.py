@@ -16,12 +16,25 @@ from typing import Optional
 from urllib.parse import parse_qs
 
 PROTECTED_PREFIXES = ("/mcp", "/messages", "/sse", "/health/transcripts")
+WORKER_PREFIX = "/worker"
 
 
 def load_tokens(env=None) -> list:
     e = os.environ if env is None else env
     raw = ",".join([e.get("MCP_AUTH_TOKENS", ""), e.get("MCP_AUTH_TOKEN", "")])
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def load_worker_tokens(env=None) -> list:
+    """Tokens that may call /worker/* ONLY. Distinct from the MCP tokens (least privilege): a leaked worker token
+    cannot use MCP tools, and an MCP token cannot claim/complete jobs. One token per worker allows revocation."""
+    e = os.environ if env is None else env
+    raw = ",".join([e.get("WORKER_AUTH_TOKENS", ""), e.get("WORKER_AUTH_TOKEN", "")])
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+class _TooLarge(Exception):
+    pass
 
 
 class SlidingWindowLimiter:
@@ -47,7 +60,7 @@ class SlidingWindowLimiter:
 
 
 class SecurityMiddleware:
-    def __init__(self, app, tokens=None, rate_limit_per_minute: Optional[int] = None):
+    def __init__(self, app, tokens=None, rate_limit_per_minute: Optional[int] = None, worker_tokens=None):
         self.app = app
         self.tokens = load_tokens() if tokens is None else tokens
         if rate_limit_per_minute is None:
@@ -56,6 +69,12 @@ class SecurityMiddleware:
             except ValueError:
                 rate_limit_per_minute = 120
         self.limiter = SlidingWindowLimiter(rate_limit_per_minute)
+        self._worker_tokens = worker_tokens
+        self.worker_limiter = SlidingWindowLimiter(int(os.environ.get("WORKER_RATE_LIMIT_PER_MINUTE", "60") or 60))
+        try:
+            self.worker_max_body = int(os.environ.get("WORKER_MAX_BODY_BYTES", str(4_000_000)))
+        except ValueError:
+            self.worker_max_body = 4_000_000
 
     @property
     def auth_enabled(self) -> bool:
@@ -94,10 +113,47 @@ class SecurityMiddleware:
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
+    async def _worker(self, scope, receive, send):
+        """/worker/*: separate bearer tokens (header only - never in URLs), disabled unless configured, body-size
+        capped, rate limited per token."""
+        tokens = load_worker_tokens() if self._worker_tokens is None else self._worker_tokens
+        if not tokens:
+            return await self._reject(send, 503, "Worker API disabled: no WORKER_AUTH_TOKEN configured")
+        headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers", [])}
+        auth = headers.get("authorization", "")
+        presented = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not presented or not any(hmac.compare_digest(presented.encode(), t.encode()) for t in tokens):
+            return await self._reject(send, 401, "Unauthorized")
+        try:                                           # re-read so the limit can be tuned without a code change
+            self.worker_limiter.limit = int(os.environ.get("WORKER_RATE_LIMIT_PER_MINUTE", "60") or 60)
+        except ValueError:
+            pass
+        wait = self.worker_limiter.check("w:" + hashlib.sha256(presented.encode()).hexdigest()[:16])
+        if wait is not None:
+            return await self._reject(send, 429, "Rate limit exceeded", wait)
+        cl = headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > self.worker_max_body:
+            return await self._reject(send, 413, "Request body too large")
+        seen = {"n": 0}
+
+        async def limited_receive():
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen["n"] += len(msg.get("body", b""))
+                if seen["n"] > self.worker_max_body:
+                    raise _TooLarge()
+            return msg
+        try:
+            return await self.app(scope, limited_receive, send)
+        except _TooLarge:
+            return await self._reject(send, 413, "Request body too large")
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path = scope.get("path", "")
+        if path == WORKER_PREFIX or path.startswith(WORKER_PREFIX + "/"):
+            return await self._worker(scope, receive, send)
         if scope.get("method") == "OPTIONS" or not path.startswith(PROTECTED_PREFIXES):
             return await self.app(scope, receive, send)
 

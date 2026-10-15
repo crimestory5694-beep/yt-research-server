@@ -106,6 +106,13 @@ class FakeUpstash:
             elif op in ("INCR", "DECR"):
                 self.data[a[0]] = int(self.data.get(a[0], 0)) + (1 if op == "INCR" else -1)
                 out.append({"result": self.data[a[0]]})
+            elif op == "HINCRBY":
+                h = self.data.setdefault(a[0], {}) if isinstance(self.data.get(a[0], {}), dict) else {}
+                h[a[1]] = int(h.get(a[1], 0)) + int(a[2]); self.data[a[0]] = h
+                out.append({"result": h[a[1]]})
+            elif op == "HGETALL":
+                h = self.data.get(a[0], {})
+                out.append({"result": [x for kv in h.items() for x in kv]})
             elif op == "EXPIRE":
                 self.ttl[a[0]] = a[1]
                 out.append({"result": 1})

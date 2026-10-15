@@ -3,7 +3,7 @@ import json
 import httpx
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Optional
 from statistics import median
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import uuid
 from transcript_service import TranscriptService, redact
 from security import SecurityMiddleware
+from worker_api import build_router as build_worker_router
+from job_queue import QueueUnavailable, LANG_RE as _JOB_LANG_RE, VIDEO_RE as _JOB_VIDEO_RE
 
 app = FastAPI(title="YouTube Research MCP Server")
 
@@ -25,6 +27,7 @@ app.add_middleware(
 )
 # Added after CORS so CORS stays outermost. Auth is OFF unless MCP_AUTH_TOKEN(S) is set.
 app.add_middleware(SecurityMiddleware)
+app.include_router(build_worker_router(lambda: get_transcript_service()))
 
 # Secrets come ONLY from environment variables (never hardcode them here).
 API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
@@ -679,9 +682,138 @@ def get_transcript_service() -> TranscriptService:
     return _transcript_service
 
 
+AUTO_QUEUE_STATUSES = {"blocked", "all_providers_failed", "timeout", "network_error", "upstream_error", "parse_error",
+                       "proxy_error", "proxy_misconfigured", "rate_limited", "provider_quota_exhausted"}
+
+
 async def tool_get_video_transcript(video_id: str, language: str = "en", any_language: bool = False) -> dict:
-    """See transcript_service.py: cache -> free YouTube -> optional proxy -> optional paid (default off)."""
-    return await get_transcript_service().get_transcript(video_id, language, any_language)
+    """See transcript_service.py: cache -> free YouTube -> optional proxy -> optional paid (default off).
+    With the durable queue enabled (TRANSCRIPT_QUEUE_ENABLED + Upstash), a retryable failure also queues a job for the
+    local worker; the original status/error is returned unchanged plus a `queued_job` field."""
+    svc = get_transcript_service()
+    res = await svc.get_transcript(video_id, language, any_language)
+    q = svc.queue
+    if q is not None and svc.cfg.queue.auto_queue and res.get("status") in AUTO_QUEUE_STATUSES:
+        from transcript_service import normalize_video_id
+        vid = normalize_video_id(video_id)
+        lang = "any" if any_language else _norm_job_language(language)
+        if vid and lang:
+            try:
+                e = await q.enqueue(vid, lang)
+                res["queued_job"] = {"job_id": e["job_id"], "state": e["state"],
+                                     "note": "A local worker will fetch this when online; ask again later."}
+            except QueueUnavailable:
+                res["queued_job"] = {"state": "queue_unavailable", "note": "Could not queue; nothing was recorded."}
+    return res
+
+
+def _norm_job_language(language: str) -> Optional[str]:
+    """Job languages are a single lowercase code (priority lists are a synchronous-tool feature)."""
+    first = (language or "en").replace(";", ",").split(",")[0].strip().lower()
+    return first if _JOB_LANG_RE.match(first) else None
+
+
+QUEUE_TOOLS = [
+    {
+        "name": "yt_queue_transcripts",
+        "description": "Queue up to 100 videos for background transcript extraction by the owner's local worker (durable; "
+                       "survives restarts). Already-cached videos are reported as 'cached'. Poll yt_transcript_queue_status, "
+                       "then read finished transcripts with yt_get_video_transcript. Free-path only; no paid APIs.",
+        "inputSchema": {"type": "object", "properties": {
+            "video_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100, "description": "Video IDs or YouTube URLs"},
+            "language": {"type": "string", "default": "en", "description": "One language code, or 'any'"},
+            "retry_failed": {"type": "boolean", "default": False, "description": "Re-open jobs that previously failed"}},
+            "required": ["video_ids"]}
+    },
+    {
+        "name": "yt_transcript_queue_status",
+        "description": "Queue depth/progress, and the state of specific videos (queued, processing, deferred, completed, failed). "
+                       "'ready' means the transcript can be read now with yt_get_video_transcript.",
+        "inputSchema": {"type": "object", "properties": {
+            "video_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+            "language": {"type": "string", "default": "en"}}}
+    },
+]
+
+
+def visible_tools() -> list:
+    """The original nine tools; the two queue tools appear only when TRANSCRIPT_QUEUE_ENABLED is set."""
+    try:
+        if get_transcript_service().cfg.queue.enabled:
+            return TOOLS + QUEUE_TOOLS
+    except Exception:
+        pass
+    return TOOLS
+
+
+async def tool_queue_transcripts(video_ids: list, language: str = "en", retry_failed: bool = False) -> dict:
+    from transcript_service import normalize_video_id
+    svc = get_transcript_service()
+    if svc.queue is None:
+        return {"status": "queue_unavailable", "error": "Durable queue is not configured (needs TRANSCRIPT_QUEUE_ENABLED=true "
+                "and an Upstash database).", "queued": 0}
+    if not isinstance(video_ids, list) or not video_ids or len(video_ids) > 100:
+        return {"status": "invalid_request", "error": "video_ids must be a list of 1-100 items", "queued": 0}
+    lang = _norm_job_language(language) if language != "any" else "any"
+    if not lang:
+        return {"status": "invalid_request", "error": "invalid language", "queued": 0}
+    results, todo = [], []
+    seen = set()
+    for raw in video_ids:
+        vid = normalize_video_id(raw) if isinstance(raw, str) else None
+        if vid is None:
+            results.append({"video_id": str(raw)[:40], "state": "invalid_video_id"}); continue
+        if vid in seen:
+            results.append({"video_id": vid, "state": "duplicate_in_request"}); continue
+        seen.add(vid)
+        if await svc.cached_result(vid, lang) is not None:
+            results.append({"video_id": vid, "state": "cached", "ready": True}); continue
+        todo.append(vid)
+    if todo:
+        try:
+            for r in await svc.queue.enqueue_many([(v, lang) for v in todo], force=bool(retry_failed)):
+                results.append({"video_id": r["video_id"], "state": {"created": "queued", "exists": "already_queued"}.get(r["state"], r["state"]),
+                                **({"job_status": r["existing_status"]} if "existing_status" in r else {})})
+        except QueueUnavailable:
+            # nothing was acknowledged: report every candidate honestly
+            return {"status": "queue_unavailable", "error": "Shared store unreachable; NOTHING was queued. Retry later.",
+                    "queued": 0, "results": results + [{"video_id": v, "state": "not_queued"} for v in todo]}
+    counts: dict = {}
+    for r in results:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+    return {"status": "ok", "language": lang, "summary": counts, "results": results}
+
+
+async def tool_transcript_queue_status(video_ids: Optional[list] = None, language: str = "en") -> dict:
+    from transcript_service import normalize_video_id
+    from job_queue import job_id
+    svc = get_transcript_service()
+    if svc.queue is None:
+        return {"status": "queue_unavailable", "error": "Durable queue is not configured."}
+    lang = _norm_job_language(language) if language != "any" else "any"
+    if not lang:
+        return {"status": "invalid_request", "error": "invalid language"}
+    try:
+        out = {"status": "ok", "queue": await svc.queue.summary()}
+        ids = [v for v in ((normalize_video_id(x) if isinstance(x, str) else None) for x in (video_ids or [])[:100]) if v]
+        if ids:
+            recs = await svc.queue.get_many([job_id(v, lang) for v in ids])
+            rows = []
+            for v in ids:
+                rec = recs.get(job_id(v, lang))
+                ready = (await svc.cached_result(v, lang)) is not None
+                rows.append({"video_id": v, "ready": ready, "state": "completed" if ready and not rec else (rec["status"] if rec else "not_queued"),
+                             **({k: rec[k] for k in ("attempts", "fail_class", "not_before", "updated")} if rec else {})})
+            out["videos"] = rows
+        return out
+    except QueueUnavailable:
+        return {"status": "queue_unavailable", "error": "Shared store unreachable."}
+
+
+async def call_tool_queue(name: str, arguments: dict):
+    if name == "yt_queue_transcripts":
+        return await tool_queue_transcripts(**arguments)
+    return await tool_transcript_queue_status(**arguments)
 
 async def call_tool(name: str, arguments: dict) -> Any:
     if name == "get_channel_stats":
@@ -702,6 +834,8 @@ async def call_tool(name: str, arguments: dict) -> Any:
         return await tool_generate_titles(**arguments)
     elif name == "yt_get_video_transcript":
         return await tool_get_video_transcript(**arguments)
+    elif name in ("yt_queue_transcripts", "yt_transcript_queue_status") and get_transcript_service().cfg.queue.enabled:
+        return await call_tool_queue(name, arguments)
     else:
         return {"error": f"Unknown tool: {name}"}
 
@@ -751,7 +885,7 @@ async def messages_endpoint(request: Request):
     elif method == "tools/list":
         return JSONResponse({
             "jsonrpc": "2.0", "id": req_id,
-            "result": {"tools": TOOLS}
+            "result": {"tools": visible_tools()}
         })
 
     elif method == "tools/call":
@@ -800,7 +934,7 @@ async def mcp_streamable(request: Request):
     elif method == "notifications/initialized":
         result = {}
     elif method == "tools/list":
-        result = {"tools": TOOLS}
+        result = {"tools": visible_tools()}
     elif method == "tools/call":
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
@@ -863,4 +997,4 @@ async def transcript_health():
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "yt-research-server", "version": "3.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}
+    return {"status": "ok", "name": "yt-research-server", "version": "3.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(visible_tools()), "endpoints": ["/mcp", "/sse"]}

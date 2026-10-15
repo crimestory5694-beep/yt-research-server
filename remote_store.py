@@ -30,6 +30,14 @@ MAX_VALUE_BYTES = 8_000_000  # Upstash free tier max request size is 10 MB
 UNAVAILABLE = object()
 
 
+class RemoteUnavailable(Exception):
+    """Transport/auth failure talking to the shared store (nothing was acknowledged)."""
+
+
+class RemoteCommandError(Exception):
+    """The store answered but rejected a command (e.g. a script error)."""
+
+
 def encode_value(kind: str, payload: dict) -> str:
     raw = json.dumps({"k": kind, "p": payload}, ensure_ascii=False, separators=(",", ":")).encode()
     return base64.b64encode(zlib.compress(raw, 6)).decode()
@@ -104,8 +112,57 @@ class RemoteStore:
             enc = encode_value(kind, {**payload, "segments": []})  # keep the text, drop timestamps
         if len(enc) > MAX_VALUE_BYTES:
             return False
-        res = await self._pipeline([["SET", f"{self.prefix}c:{key}", enc, "EX", int(max(ttl, 1))]])
+        # Storage accounting: bytes written per UTC day in one small hash (35-day expiry). Cache entries live at most
+        # ~30 days, so the sum of recent buckets approximates live storage without scanning the keyspace.
+        day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+        res = await self._pipeline([["SET", f"{self.prefix}c:{key}", enc, "EX", int(max(ttl, 1))],
+                                    ["HINCRBY", f"{self.prefix}cw", day, len(enc)],
+                                    ["EXPIRE", f"{self.prefix}cw", 35 * 86400]])
         return res is not UNAVAILABLE
+
+    async def storage_estimate(self, days: int = 31) -> Optional[dict]:
+        """Approximate live cache bytes (sum of recent daily write buckets). None if the store is unreachable."""
+        res = await self._pipeline([["HGETALL", f"{self.prefix}cw"]])
+        if res is UNAVAILABLE:
+            return None
+        raw = res[0]
+        pairs = dict(zip(raw[0::2], raw[1::2])) if isinstance(raw, list) else dict(raw or {})
+        cutoff = time.strftime("%Y-%m-%d", time.gmtime(self._clock() - days * 86400))
+        live = sum(int(v) for d, v in pairs.items() if d >= cutoff)
+        return {"approx_cache_bytes": live, "days_tracked": len(pairs)}
+
+    # ── generic command access for the job queue ──
+    async def exec(self, commands: list) -> list:
+        """Run commands in one pipeline round trip and return the raw per-command results. Raises RemoteUnavailable on
+        transport/auth failure (and feeds the circuit breaker); individual command errors raise RemoteCommandError."""
+        if not self.available:
+            self.stats["short_circuited"] += 1
+            raise RemoteUnavailable("circuit open")
+        try:
+            async with self._factory() as client:
+                r = await client.post(self.url + "/pipeline", json=commands,
+                                      headers={"Authorization": f"Bearer {self.token}"})
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            body = r.json()
+            if not isinstance(body, list) or len(body) != len(commands):
+                raise RuntimeError("unexpected response shape")
+        except Exception as e:
+            self.stats["errors"] += 1
+            self.last_error = type(e).__name__ + (f": {e}" if isinstance(e, RuntimeError) else "")
+            self._fails += 1
+            if self._fails >= self._breaker_failures:
+                self._open_until = self._clock() + self._breaker_seconds
+                self._fails = 0
+            raise RemoteUnavailable(self.last_error) from None
+        self._fails = 0
+        self.stats["commands"] += len(commands)
+        out = []
+        for item in body:
+            if isinstance(item, dict) and item.get("error"):
+                raise RemoteCommandError(str(item["error"])[:200])
+            out.append(item.get("result") if isinstance(item, dict) else item)
+        return out
 
     # ── cooldowns ──
     async def get_cooldown(self, provider: str, now: float):

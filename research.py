@@ -496,19 +496,32 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         "VERDICT: <SUPPORTS or REFUTES or IRRELEVANT>\n"
         "REASON: <one short sentence>"
     )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 150},
+    }
+    # Some newly-created Gemini API keys/projects 404 on generateContent for a
+    # specific model even though models.list shows it as available (a known
+    # Google-side activation-lag/tier issue, not something we can fix from
+    # here) — try the configured model first, then fall back to a second,
+    # widely-available free-tier model name before giving up.
+    models_to_try = [GEMINI_MODEL] + (["gemini-2.0-flash"] if GEMINI_MODEL != "gemini-2.0-flash" else [])
+    last_err = ""
     try:
         async with httpx.AsyncClient() as c:
-            res = await c.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0, "maxOutputTokens": 150},
-                },
-                timeout=20,
-            )
-        if res.status_code != 200:
-            return {"verdict": "UNKNOWN", "reason": f"Gemini API error {res.status_code}"}
+            res = None
+            for model in models_to_try:
+                res = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    params={"key": GEMINI_API_KEY},
+                    json=body,
+                    timeout=20,
+                )
+                if res.status_code == 200:
+                    break
+                last_err = f"model={model} status={res.status_code} body={res.text[:300]}"
+        if res is None or res.status_code != 200:
+            return {"verdict": "UNKNOWN", "reason": f"Gemini API error: {last_err}"}
         data = res.json()
         text = (
             data.get("candidates", [{}])[0]

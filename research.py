@@ -411,6 +411,56 @@ async def fetch_page_content(url: str, max_length: int = 5000) -> Optional[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  RELEVANCE FILTERING
+#  Search engines (especially the Wikipedia full-text fallback used when no
+#  paid engine is configured) can return results that are keyword-matched but
+#  topically unrelated to the query. Tools that make a verdict (verify_claims,
+#  check_content_saturation, cross_reference) must not treat an irrelevant hit
+#  as support for that verdict — this was producing false VERIFIED/LOW results
+#  off of totally unrelated pages (e.g. "The Three Stooges" "supporting" a
+#  YouTube RPM claim). _is_relevant() is a cheap keyword-overlap heuristic to
+#  reject those before they get counted.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "on", "for",
+    "and", "or", "but", "than", "that", "this", "it", "its", "as", "by", "with",
+    "be", "been", "has", "have", "had", "not", "no", "do", "does", "did", "will",
+    "would", "can", "could", "about", "into", "than", "then", "so", "if", "you",
+    "your", "they", "their", "what", "which", "who", "how", "why", "all", "more",
+}
+
+
+def _keywords(text: str) -> set:
+    words = re.findall(r"[a-zA-Z]{3,}", (text or "").lower())
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def _is_relevant(query: str, *texts: str, min_overlap: int = 1) -> bool:
+    """Heuristic: does candidate text share enough meaningful keywords with the query
+    to plausibly be about the same thing? This is NOT semantic understanding — it
+    will not catch every irrelevant result — but it reliably rejects the kind of
+    random-noise hits a full-text search fallback can return for long claim
+    sentences or multi-word topics. Requires overlap scaled to query length so a
+    short query still needs a real match, not just one common word."""
+    q_kw = _keywords(query)
+    if not q_kw:
+        return True  # nothing to check against; don't block
+    combined = " ".join(t for t in texts if t)
+    t_kw = _keywords(combined)
+    if not t_kw:
+        return False
+    overlap = q_kw & t_kw
+    needed = max(min_overlap, min(2, len(q_kw)))
+    return len(overlap) >= needed
+
+
+def _filter_relevant(query: str, results: list, text_fields=("title", "snippet")) -> list:
+    """Drop results that fail the relevance check against query."""
+    return [r for r in results if _is_relevant(query, *[r.get(f, "") for f in text_fields])]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UNIFIED SEARCH
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -621,23 +671,34 @@ async def _h_verify_claims(args: dict) -> dict:
     lang = args.get("language", "en")
     report = []
     for claim in claims[:20]:
-        results = await unified_search(claim, max_results=3, language=lang, include_wikipedia=True)
+        raw_results = await unified_search(claim, max_results=5, language=lang, include_wikipedia=True)
+        # Reject results that are just keyword noise from a weak fallback engine
+        # (e.g. Wikipedia full-text search matching stray words in a long claim)
+        # before they can count as "support" for the claim.
+        results = _filter_relevant(claim, raw_results)[:3]
         checked = []
-        for r in results[:3]:
+        for r in results:
             content = await fetch_page_content(r["url"], 2000)
+            is_relevant_content = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
             checked.append({
                 "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
                 "hasContent": bool(content and len(content) > 100),
+                "isRelevant": is_relevant_content,
                 "contentPreview": ((content or r.get("snippet") or "")[:500]),
             })
-        strong = sum(1 for c in checked if c["hasContent"])
-        status = "VERIFIED" if strong >= 2 else ("PARTIALLY VERIFIED" if strong == 1 else "UNVERIFIED")
-        icon = "✅" if strong >= 2 else ("⚠️" if strong == 1 else "❌")
+        # A source only counts as supporting the claim if it both has real content
+        # AND is actually about the same subject as the claim.
+        strong = sum(1 for c in checked if c["hasContent"] and c["isRelevant"])
+        if not raw_results or not results:
+            status, icon = "UNVERIFIED — no relevant sources found", "❌"
+        else:
+            status = "VERIFIED" if strong >= 2 else ("PARTIALLY VERIFIED" if strong == 1 else "UNVERIFIED")
+            icon = "✅" if strong >= 2 else ("⚠️" if strong == 1 else "❌")
         report.append({"claim": claim, "status": status, "icon": icon, "sources": checked})
 
     verified = sum(1 for r in report if r["status"] == "VERIFIED")
     partial = sum(1 for r in report if r["status"] == "PARTIALLY VERIFIED")
-    unverified = sum(1 for r in report if r["status"] == "UNVERIFIED")
+    unverified = sum(1 for r in report if r["status"].startswith("UNVERIFIED"))
 
     out = f"## Claim Verification Report\n\n**Total Claims:** {len(claims)}\n"
     out += f"✅ Verified: {verified} | ⚠️ Partial: {partial} | ❌ Unverified: {unverified}\n\n"
@@ -754,12 +815,34 @@ async def _h_check_content_saturation(args: dict) -> dict:
     topic = args["topic"]
     lang = args.get("language", "en")
 
-    web_results = await unified_search(topic, max_results=10, language=lang, include_wikipedia=False)
-    yt_results = await unified_search(f"{topic} YouTube video", max_results=5, language=lang, include_wikipedia=False)
-    wiki_results = await search_wikipedia(topic, lang, 5)
+    web_results_raw = await unified_search(topic, max_results=10, language=lang, include_wikipedia=False)
+    yt_results_raw = await unified_search(f"{topic} YouTube video", max_results=5, language=lang, include_wikipedia=False)
+    wiki_results_raw = await search_wikipedia(topic, lang, 5)
+
+    # Only count results that are actually about the topic — the Wikipedia
+    # full-text fallback in particular can return unrelated pages for a
+    # multi-word topic phrase when no paid search engine is configured, which
+    # previously inflated the "coverage" count with noise (e.g. unrelated
+    # pages counted as 5 "results" for an unrelated niche).
+    web_results = _filter_relevant(topic, web_results_raw)
+    yt_results = _filter_relevant(topic, yt_results_raw)
+    wiki_results = _filter_relevant(topic, wiki_results_raw)
 
     total = len(web_results) + len(yt_results) + len(wiki_results)
-    if total >= 18:
+    engines_with_real_results = sum(1 for r in (web_results, yt_results) if r)
+    data_quality_warning = ""
+
+    if not web_results_raw and not yt_results_raw:
+        # DuckDuckGo (and any paid engine, if configured) returned nothing at
+        # all — the only signal available is Wikipedia, which is not a proxy
+        # for YouTube content saturation. Don't issue a confident verdict off
+        # of that alone.
+        level = "UNKNOWN"
+        advice = ("Could not get real web/YouTube search results for this topic (search engines returned "
+                   "nothing — likely blocked, or SERPER_API_KEY/TAVILY_API_KEY/GOOGLE_API_KEY not configured). "
+                   "Wikipedia coverage alone cannot tell you how saturated this niche is on YouTube. "
+                   "Verify manually or configure a search API key and retry.")
+    elif total >= 18:
         level, advice = "HIGH", "Topic is heavily covered. Need a unique angle, untold sub-story, or niche perspective to stand out."
     elif total >= 10:
         level, advice = "MEDIUM", "Some coverage exists but room for new content with a fresh angle."
@@ -768,7 +851,11 @@ async def _h_check_content_saturation(args: dict) -> dict:
     else:
         level, advice = "VERY LOW", "Almost no coverage — either untapped opportunity or no audience demand. Research search volume."
 
-    out = f"## Content Saturation: {topic}\n\n**Saturation Level:** {level}\n**Total Results:** {total}\n**Assessment:** {advice}\n\n"
+    if engines_with_real_results == 0 and level != "UNKNOWN":
+        data_quality_warning = ("\n⚠️ **Data quality note:** this verdict is based only on Wikipedia results "
+                                 "(web/YouTube search engines returned nothing relevant) and may be unreliable.\n")
+
+    out = f"## Content Saturation: {topic}\n\n**Saturation Level:** {level}\n**Total Results:** {total}\n**Assessment:** {advice}\n{data_quality_warning}\n"
     out += f"### Web Coverage ({len(web_results)} results)\n"
     for r in web_results[:5]:
         out += f"- [{r['title']}]({r['url']})\n"
@@ -786,9 +873,10 @@ async def _h_cross_reference(args: dict) -> dict:
     min_src = min(int(args.get("min_sources", 3)), 6)
     lang = args.get("language", "en")
 
-    results = await unified_search(claim, max_results=min_src + 2, language=lang)
+    raw_results = await unified_search(claim, max_results=min_src + 4, language=lang)
+    results = _filter_relevant(claim, raw_results)[: min_src + 2]
     sources = []
-    for r in results[: min_src + 2]:
+    for r in results:
         content = await fetch_page_content(r["url"], 2500)
         sources.append({
             "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
@@ -796,12 +884,17 @@ async def _h_cross_reference(args: dict) -> dict:
         })
 
     source_types = list({s["engine"] for s in sources})
+    independence_warning = ""
+    if len(source_types) <= 1 and sources:
+        independence_warning = (f"\n⚠️ **Note:** all sources came from a single engine ({source_types[0]}) — "
+                                 "this is not an independent cross-reference. Configure SERPER_API_KEY/"
+                                 "TAVILY_API_KEY/GOOGLE_API_KEY for real source diversity.\n")
 
-    out = f"## Cross-Reference Report\n\n**Claim:** \"{claim}\"\n**Sources Found:** {len(sources)}\n**Source Types:** {', '.join(source_types)}\n\n"
+    out = f"## Cross-Reference Report\n\n**Claim:** \"{claim}\"\n**Sources Found:** {len(sources)}\n**Source Types:** {', '.join(source_types) or 'none'}\n{independence_warning}\n"
     for i, s in enumerate(sources):
         out += f"---\n### Source {i+1}: {s['title']}\n**URL:** {s['url']} *({s['engine']})*\n\n"
         out += s["content"][:1500] + "\n\n"
-    out += f"---\n\n**Verification Notes:**\n- {len(sources)} independent sources checked\n- Source diversity: {len(source_types)} different engines\n- Review content above to confirm agreement or find contradictions\n"
+    out += f"---\n\n**Verification Notes:**\n- {len(sources)} sources checked for topical relevance\n- Source diversity: {len(source_types)} different engines\n- Review content above to confirm agreement or find contradictions\n"
     return {"report": out, "sources_count": len(sources)}
 
 

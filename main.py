@@ -560,35 +560,79 @@ async def tool_generate_titles(topic: str, niche: str = "documentary", max_title
         if remainder and len(remainder) > 2:
             angle_words.append(remainder)
 
-    # Title formula templates — organized by type
-    formulas = [
-        # FORMULA 1: Name + Shocking Fact
-        {"type": "shocking_fact", "template": f"{topic} — The Story No One Tells You", "score": 75},
-        {"type": "shocking_fact", "template": f"The Untold Story of {topic}", "score": 72},
-        {"type": "shocking_fact", "template": f"{topic} — What Really Happened", "score": 70},
+    # Title formula templates — organized by type.
+    # Two sets, chosen by whether `topic` looks like a NAMED SUBJECT (a person,
+    # criminal, soldier — "caught", "wanted", "got away with it" make sense) or
+    # a GENERAL TOPIC PHRASE (a niche/category like "wilderness survival
+    # stories", "toddler sleep habits" — those same templates produce broken
+    # grammar, e.g. "Why wilderness survival stories Was Impossible to Catch").
+    # Detect via generic category/plural words that a person's name would not contain.
+    _GENERIC_TOPIC_WORDS = {
+        "stories", "story", "tips", "tip", "guide", "guides", "secrets", "secret",
+        "hacks", "hack", "mistakes", "mistake", "psychology", "method", "methods",
+        "ideas", "idea", "facts", "fact", "myths", "myth", "truth", "lessons",
+        "lesson", "rules", "rule", "tricks", "trick", "habits", "habit", "ways",
+        "signs", "sign", "reasons", "reason", "tools", "strategies", "strategy",
+    }
+    is_person_subject = not any(w in _GENERIC_TOPIC_WORDS for w in topic.lower().split())
 
-        # FORMULA 2: Why/How Mystery
-        {"type": "mystery", "template": f"Why {topic} Was Impossible to Catch", "score": 78},
-        {"type": "mystery", "template": f"How {topic} Got Away With It for So Long", "score": 76},
-        {"type": "mystery", "template": f"Why Nobody Could Stop {topic}", "score": 74},
+    if is_person_subject:
+        formulas = [
+            # FORMULA 1: Name + Shocking Fact
+            {"type": "shocking_fact", "template": f"{topic} — The Story No One Tells You", "score": 75},
+            {"type": "shocking_fact", "template": f"The Untold Story of {topic}", "score": 72},
+            {"type": "shocking_fact", "template": f"{topic} — What Really Happened", "score": 70},
 
-        # FORMULA 3: Superlative + Niche
-        {"type": "superlative", "template": f"The Most Dangerous {niche.split()[0].title()} in History — {topic}", "score": 73},
-        {"type": "superlative", "template": f"{topic} — The {niche.split()[0].title()} That Shocked the World", "score": 71},
+            # FORMULA 2: Why/How Mystery
+            {"type": "mystery", "template": f"Why {topic} Was Impossible to Catch", "score": 78},
+            {"type": "mystery", "template": f"How {topic} Got Away With It for So Long", "score": 76},
+            {"type": "mystery", "template": f"Why Nobody Could Stop {topic}", "score": 74},
 
-        # FORMULA 4: Number + Extreme
-        {"type": "number", "template": f"{topic} — The Rise and Fall of a Criminal Empire", "score": 69},
-        {"type": "number", "template": f"Inside {topic}'s Secret World", "score": 67},
+            # FORMULA 3: Superlative + Niche
+            {"type": "superlative", "template": f"The Most Dangerous {niche.split()[0].title()} in History — {topic}", "score": 73},
+            {"type": "superlative", "template": f"{topic} — The {niche.split()[0].title()} That Shocked the World", "score": 71},
 
-        # FORMULA 5: Role Reveal / Identity
-        {"type": "role_reveal", "template": f"Who Was {topic}? The Full Story", "score": 65},
-        {"type": "role_reveal", "template": f"{topic} — From Nobody to the Most Wanted", "score": 74},
+            # FORMULA 4: Number + Extreme
+            {"type": "number", "template": f"{topic} — The Rise and Fall of a Criminal Empire", "score": 69},
+            {"type": "number", "template": f"Inside {topic}'s Secret World", "score": 67},
 
-        # FORMULA 6: Emotional hook
-        {"type": "emotional", "template": f"The Dark Truth About {topic}", "score": 77},
-        {"type": "emotional", "template": f"{topic} — The Story That Will Change How You Think", "score": 68},
-        {"type": "emotional", "template": f"The Real {topic} — What History Books Don't Tell You", "score": 76},
-    ]
+            # FORMULA 5: Role Reveal / Identity
+            {"type": "role_reveal", "template": f"Who Was {topic}? The Full Story", "score": 65},
+            {"type": "role_reveal", "template": f"{topic} — From Nobody to the Most Wanted", "score": 74},
+
+            # FORMULA 6: Emotional hook
+            {"type": "emotional", "template": f"The Dark Truth About {topic}", "score": 77},
+            {"type": "emotional", "template": f"{topic} — The Story That Will Change How You Think", "score": 68},
+            {"type": "emotional", "template": f"The Real {topic} — What History Books Don't Tell You", "score": 76},
+        ]
+    else:
+        formulas = [
+            # FORMULA 1: Shocking Fact
+            {"type": "shocking_fact", "template": f"The Truth About {topic} Nobody Talks About", "score": 75},
+            {"type": "shocking_fact", "template": f"{topic}: What They Don't Tell You", "score": 74},
+            {"type": "shocking_fact", "template": f"{topic} — What Really Happens", "score": 70},
+
+            # FORMULA 2: Why/How Mystery
+            {"type": "mystery", "template": f"Why {topic} Actually Work (Or Don't)", "score": 76},
+            {"type": "mystery", "template": f"How {topic} Can Change Everything", "score": 73},
+
+            # FORMULA 3: Superlative + Niche
+            {"type": "superlative", "template": f"The Best {topic} You've Never Heard Of", "score": 72},
+            {"type": "superlative", "template": f"{topic} That Actually Work, According to {niche.split()[0].title()}", "score": 69},
+
+            # FORMULA 4: Number + List
+            {"type": "number", "template": f"5 {topic} That Actually Work", "score": 71},
+            {"type": "number", "template": f"7 {topic} Most People Get Wrong", "score": 70},
+
+            # FORMULA 5: Explainer / Identity
+            {"type": "role_reveal", "template": f"{topic}, Explained", "score": 65},
+            {"type": "role_reveal", "template": f"Everything You Need to Know About {topic}", "score": 66},
+
+            # FORMULA 6: Emotional hook
+            {"type": "emotional", "template": f"The Dark Side of {topic}", "score": 77},
+            {"type": "emotional", "template": f"{topic} — What Science Actually Says", "score": 73},
+            {"type": "emotional", "template": f"The Hidden Truth Behind {topic}", "score": 75},
+        ]
 
     # Add autocomplete-powered titles
     for angle in angle_words[:3]:

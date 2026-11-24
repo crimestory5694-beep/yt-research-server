@@ -1064,11 +1064,19 @@ async def _h_verify_claims(args: dict) -> dict:
         for r in report for s in r["sources"]
     )
 
-    out = f"## Claim Verification Report\n\n**Total Claims:** {len(claims)}\n"
+    # This banner is deliberately the VERY FIRST thing in the report, in caps,
+    # with an action verb — a chat client summarizing or truncating tool
+    # output tends to keep the first line verbatim and compress/drop
+    # anything buried mid-document. A warning placed after the report title
+    # and stats line (as this used to be) was too easy for a summary to skip.
+    out = ""
+    if rate_limited:
+        out += ("🛑 ACTION REQUIRED — GEMINI_API_KEY QUOTA EXCEEDED 🛑\n"
+                "Replace GEMINI_API_KEY on Render now (Environment tab -> edit the value -> Save, rebuild, and deploy) "
+                "with a different Gemini key. Verdicts below that are affected are UNKNOWN/heuristic-only, not false positives.\n\n")
+    out += f"## Claim Verification Report\n\n**Total Claims:** {len(claims)}\n"
     out += (f"✅ Verified: {verified} | ⚠️ Partial: {partial} | 🔴 Contradicted: {contradicted} | "
             f"❌ Unverified: {unverified}\n")
-    if rate_limited:
-        out += "\n🛑 **GEMINI RATE LIMITED:** Your GEMINI_API_KEY hit its free-tier quota during this check — the verdicts below are degraded (treated as UNKNOWN, not false positives). Rotate to a different GEMINI_API_KEY now, or call `research_api_status` to confirm.\n"
     if not use_llm:
         out += "\n⚠️ **Note:** GEMINI_API_KEY not configured — using a weaker keyword-overlap heuristic instead of real LLM judgment. Verdicts here are less reliable.\n"
     out += "\n"
@@ -1077,7 +1085,15 @@ async def _h_verify_claims(args: dict) -> dict:
         for s in r["sources"]:
             out += f"- [{s['title']}]({s['url']}) — **{s['verdict']}**: {s.get('reason', '')}\n"
         out += "\n"
-    return {"report": out, "verified": verified, "partial": partial, "contradicted": contradicted, "unverified": unverified}
+    return {
+        "report": out,
+        "verified": verified, "partial": partial, "contradicted": contradicted, "unverified": unverified,
+        # Structured, top-level fields too — not just buried in the markdown
+        # text — so a client reads "rotate this key" as plain data, not
+        # something it has to notice inside a long report string.
+        "gemini_rate_limited": rate_limited,
+        "action_required": "Replace GEMINI_API_KEY on Render with a different key — current one has hit its quota." if rate_limited else None,
+    }
 
 
 async def _h_find_primary_sources(args: dict) -> dict:
@@ -1427,11 +1443,25 @@ async def _h_research_api_status(_args: dict) -> dict:
         },
         "gemini": await _gemini_health_check(),
     }
-    out = "## Research Server — API Status\n\n| Engine | Status | Details |\n|--------|--------|--------|\n"
+    gemini_rate_limited = "RATE_LIMITED" in engines["gemini"]["status"]
+    out = ""
+    if gemini_rate_limited:
+        # First line, in caps, with the concrete action — not buried after
+        # the table — so a chat client summarizing this tool's output can't
+        # easily drop it.
+        out += ("🛑 ACTION REQUIRED — GEMINI_API_KEY QUOTA EXCEEDED 🛑\n"
+                "Replace GEMINI_API_KEY on Render now (Environment tab -> edit the value -> Save, rebuild, and deploy) "
+                "with a different Gemini key.\n\n")
+    out += "## Research Server — API Status\n\n| Engine | Status | Details |\n|--------|--------|--------|\n"
     for name, info in engines.items():
         out += f"| {name} | {info['status']} | {info['note']} |\n"
     out += "\n⚠️ If `gemini` shows RATE_LIMITED, verify_claims will fall back to a less reliable keyword check until you add a fresh GEMINI_API_KEY.\n"
-    return {"engines": engines, "report": out}
+    return {
+        "engines": engines,
+        "report": out,
+        "gemini_rate_limited": gemini_rate_limited,
+        "action_required": "Replace GEMINI_API_KEY on Render with a different key — current one has hit its quota." if gemini_rate_limited else None,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════

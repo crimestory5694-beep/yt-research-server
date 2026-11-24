@@ -570,16 +570,30 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
 
 
 async def unified_search(query: str, max_results: int = 5, language: str = "en", include_wikipedia: bool = True) -> list:
-    """Run all configured engines in parallel, merge & deduplicate."""
-    tasks = [_duckduckgo_search(query, max_results)]
-    if include_wikipedia:
-        tasks.append(search_wikipedia(query, language, 5))
-    if GOOGLE_API_KEY and GOOGLE_CX:
-        tasks.append(_google_search(query, max_results, language))
+    """Run all configured engines in parallel, merge & deduplicate.
+
+    Engine order here matters a lot more than it looks: the merged list is
+    capped below, so whichever engine's results land earlier in `tasks`
+    survives that cap. Configured paid engines (Serper/Tavily/Google) return
+    genuinely relevant results and were previously listed LAST, after
+    DuckDuckGo and Wikipedia — so on queries where DuckDuckGo is blocked
+    (common from datacenter/Render IPs) and Wikipedia's full-text search
+    returns topically-unrelated "noise" pages for a multi-word, non-
+    encyclopedic query (e.g. a claim sentence matching random Wikipedia
+    articles that happen to share a word), the noise filled the cap and
+    good results from paid engines never made it into the list at all.
+    Quality engines now go first, Wikipedia last (and capped at a smaller
+    count — it's the noisiest source for this kind of query)."""
+    tasks = []
     if SERPER_API_KEY:
         tasks.append(_serper_search(query, max_results, language))
     if TAVILY_API_KEY:
         tasks.append(_tavily_search(query, max_results))
+    if GOOGLE_API_KEY and GOOGLE_CX:
+        tasks.append(_google_search(query, max_results, language))
+    tasks.append(_duckduckgo_search(query, max_results))
+    if include_wikipedia:
+        tasks.append(search_wikipedia(query, language, min(max_results, 3)))
 
     all_arrays = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -593,7 +607,10 @@ async def unified_search(query: str, max_results: int = 5, language: str = "en",
             if norm not in seen:
                 seen.add(norm)
                 merged.append(r)
-    return merged[: max_results + 2]
+    # A bit more headroom than before (max_results + 2 -> + 4): with quality
+    # engines now listed first, the extra slots mostly go to them rather
+    # than to low-value fallback noise.
+    return merged[: max_results + 4]
 
 
 async def multi_search(queries: list, max_results: int = 5, language: str = "en") -> list:
@@ -1143,14 +1160,28 @@ async def _gemini_health_check() -> dict:
         "contents": [{"parts": [{"text": "Reply with exactly one word: OK"}]}],
         "generationConfig": {"temperature": 0, "maxOutputTokens": 5},
     }
+    # Retest #6 showed the 3 real _gemini_judge calls in the SAME run all
+    # succeeded, while this standalone health-check call timed out — i.e.
+    # Gemini itself was reachable and working, just not within this one
+    # call's old 15s window. Give it the same 20s timeout _gemini_judge uses,
+    # plus one retry, before reporting a failure.
+    last_exc = None
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient() as c:
+                res = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                    params={"key": GEMINI_API_KEY},
+                    json=body,
+                    timeout=20,
+                )
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
     try:
-        async with httpx.AsyncClient() as c:
-            res = await c.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                json=body,
-                timeout=15,
-            )
+        if last_exc is not None:
+            raise last_exc
         if res.status_code == 200:
             return {"status": f"✅ Working ({GEMINI_MODEL})", "note": "Live-checked just now — key is good and quota has room."}
         if res.status_code == 429:

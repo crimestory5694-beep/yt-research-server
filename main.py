@@ -10,7 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import uuid
 
-app = FastAPI(title="YouTube Research MCP Server")
+from research import RESEARCH_TOOLS, RESEARCH_TOOL_NAMES, handle_research_tool
+
+app = FastAPI(title="YouTube + Research MCP Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -144,6 +146,9 @@ TOOLS = [
         }
     }
 ]
+
+# Add research tools to the unified TOOLS list
+TOOLS.extend(RESEARCH_TOOLS)
 
 # ─── YOUTUBE API HELPERS ─────────────────────────────────────────────────────
 
@@ -780,6 +785,8 @@ async def call_tool(name: str, arguments: dict) -> Any:
         return await tool_generate_titles(**arguments)
     elif name == "yt_get_video_transcript":
         return await tool_get_video_transcript(**arguments)
+    elif name in RESEARCH_TOOL_NAMES:
+        return await handle_research_tool(name, arguments)
     else:
         return {"error": f"Unknown tool: {name}"}
 
@@ -822,7 +829,7 @@ async def messages_endpoint(request: Request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "yt-research-server", "version": "3.0.0"}
+                "serverInfo": {"name": "yt-research-server", "version": "4.0.0"}
             }
         })
 
@@ -873,7 +880,7 @@ async def mcp_streamable(request: Request):
         result = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "yt-research-server", "version": "3.0.0"}
+            "serverInfo": {"name": "yt-research-server", "version": "4.0.0"}
         }
     elif method == "notifications/initialized":
         result = {}
@@ -926,4 +933,4 @@ async def mcp_streamable_get(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "yt-research-server", "version": "3.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}
+    return {"status": "ok", "name": "yt-research-server", "version": "4.0.0", "protocol": "MCP Streamable HTTP + SSE", "tools": len(TOOLS), "endpoints": ["/mcp", "/sse"]}

@@ -501,9 +501,21 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         "VERDICT: <SUPPORTS or REFUTES or IRRELEVANT>\n"
         "REASON: <one short sentence>"
     )
+    # thinkingBudget: 0 turns off Gemini's internal "thinking" tokens, which
+    # on gemini-3.x models are otherwise generated INSIDE the same
+    # maxOutputTokens budget as the visible answer — Retest #7 showed
+    # responses cut off mid-word ("VERDICT: IRRELEV") well before a 250-token
+    # budget should have run out on a two-line answer, which is exactly what
+    # thinking tokens eating the budget looks like. If a model/API version
+    # rejects this field we retry once without it rather than failing outright.
+    base_generation_config = {"temperature": 0, "maxOutputTokens": 400}
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 250},
+        "generationConfig": {**base_generation_config, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    body_no_thinking_cfg = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": base_generation_config,
     }
     # Google has retired Gemini free-tier model names more than once during
     # development of this tool (gemini-2.5-flash, then gemini-2.0-flash both
@@ -517,12 +529,24 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         async with httpx.AsyncClient() as c:
             res = None
             for model in models_to_try:
+                req_body = body
                 res = await c.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     params={"key": GEMINI_API_KEY},
-                    json=body,
+                    json=req_body,
                     timeout=20,
                 )
+                if res.status_code == 400 and "thinkingConfig" in res.text:
+                    # This model/API version doesn't accept thinkingConfig —
+                    # retry the same model once without it rather than
+                    # treating it as a hard failure.
+                    req_body = body_no_thinking_cfg
+                    res = await c.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        params={"key": GEMINI_API_KEY},
+                        json=req_body,
+                        timeout=20,
+                    )
                 if res.status_code == 200:
                     break
                 if res.status_code == 429:
@@ -539,18 +563,39 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         if res is None or res.status_code != 200:
             return {"verdict": "UNKNOWN", "reason": f"Gemini API error: {last_err}"}
         data = res.json()
+        candidate = (data.get("candidates") or [{}])[0]
+        finish_reason = candidate.get("finishReason", "")
         text = (
-            data.get("candidates", [{}])[0]
+            candidate
             .get("content", {})
             .get("parts", [{}])[0]
             .get("text", "")
         )
         m = re.search(r"VERDICT:\s*(SUPPORTS|REFUTES|IRRELEVANT)", text, re.IGNORECASE)
+        truncated_verdict = False
+        if not m:
+            # Response got cut off mid-word before finishing the VERDICT
+            # line (e.g. "VERDICT: IRRELEV") — an unambiguous prefix of one
+            # of the three allowed words is still a usable verdict, just a
+            # truncated one. Only recover when the prefix is long enough
+            # (4+ chars) to be unambiguous between SUPPORTS/REFUTES/IRRELEVANT.
+            pm = re.search(r"VERDICT:\s*([A-Z]{4,})", text, re.IGNORECASE)
+            if pm:
+                prefix = pm.group(1).upper()
+                for word in ("SUPPORTS", "REFUTES", "IRRELEVANT"):
+                    if word.startswith(prefix):
+                        m = True
+                        verdict_word = word
+                        truncated_verdict = True
+                        break
         reason_m = re.search(r"REASON:\s*(.+)", text)
-        verdict = m.group(1).upper() if m else "UNKNOWN"
+        if m is True:
+            verdict = verdict_word
+        else:
+            verdict = m.group(1).upper() if m else "UNKNOWN"
         reason = reason_m.group(1).strip() if reason_m else text.strip()[:200]
-        # Guard against two ways this can come out unreadable in a markdown
-        # report: (1) Gemini occasionally echoes the prompt's own
+        # Guard against ways this can come out unreadable or misleading in a
+        # markdown report: (1) Gemini occasionally echoes the prompt's own
         # "<one short sentence>" placeholder verbatim instead of writing a
         # real reason; (2) any literal "<"/">" in the reason gets swallowed
         # by markdown/HTML renderers (observed as a reason truncated to a
@@ -559,6 +604,12 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         reason = re.sub(r"[<>]", "", reason).strip()
         if not reason or reason.lower() in ("one short sentence", ""):
             reason = f"Gemini returned no usable reason text (raw: {text.strip()[:150]!r})" if text.strip() else "Gemini returned an empty response (no candidates — possibly blocked by safety filters or hit max output tokens)."
+        if finish_reason == "MAX_TOKENS" or truncated_verdict:
+            # Make truncation visible rather than silently guessing — same
+            # pattern as the RATE_LIMITED marker, so this is easy to spot
+            # and distinguish from a genuine model judgment in ChatGPT output.
+            prefix = "TRUNCATED (verdict recovered from a cut-off response): " if truncated_verdict else "TRUNCATED (hit max output tokens): "
+            reason = prefix + reason
         return {"verdict": verdict, "reason": reason}
     except Exception as e:
         return {"verdict": "UNKNOWN", "reason": f"Gemini call failed: {type(e).__name__}: {e}" if str(e) else f"Gemini call failed: {type(e).__name__} (no further detail — likely a timeout)"}
@@ -1156,9 +1207,12 @@ async def _gemini_health_check() -> dict:
             "status": "➖ Not set",
             "note": "Optional — set GEMINI_API_KEY for real claim-verification (used by verify_claims)",
         }
+    # thinkingBudget: 0 avoids wasting a round of internal "thinking" tokens
+    # on gemini-3.x models for what should be a one-word answer (also keeps
+    # this health-check call itself fast, since it's pure overhead).
     body = {
         "contents": [{"parts": [{"text": "Reply with exactly one word: OK"}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 5},
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 10, "thinkingConfig": {"thinkingBudget": 0}},
     }
     # Retest #6 showed the 3 real _gemini_judge calls in the SAME run all
     # succeeded, while this standalone health-check call timed out — i.e.

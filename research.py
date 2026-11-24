@@ -33,7 +33,12 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-2.0-flash and gemini-2.5-flash were both retired from the free tier
+# (confirmed via the API's own deprecation error, which pointed at
+# gemini-3.8-flash — a paid-tier model). gemini-3.6-flash is the current
+# free-tier equivalent as of testing; override via GEMINI_MODEL if Google
+# changes free-tier availability again.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -500,13 +505,14 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0, "maxOutputTokens": 150},
     }
-    # Some newly-created Gemini API keys/projects 404 on generateContent for a
-    # specific model even though models.list shows it as available (a known
-    # Google-side activation-lag/tier issue, not something we can fix from
-    # here) — try the configured model first, then fall back to a second,
-    # widely-available free-tier model name before giving up.
-    models_to_try = [GEMINI_MODEL] + (["gemini-2.0-flash"] if GEMINI_MODEL != "gemini-2.0-flash" else [])
+    # Google has retired Gemini free-tier model names more than once during
+    # development of this tool (gemini-2.5-flash, then gemini-2.0-flash both
+    # 404'd with "no longer available" errors pointing at paid-tier
+    # replacements) — try the configured model, then one more known-current
+    # free-tier name, before giving up.
+    models_to_try = [GEMINI_MODEL] + (["gemini-3.6-flash"] if GEMINI_MODEL != "gemini-3.6-flash" else [])
     last_err = ""
+    rate_limited = False
     try:
         async with httpx.AsyncClient() as c:
             res = None
@@ -519,7 +525,17 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
                 )
                 if res.status_code == 200:
                     break
+                if res.status_code == 429:
+                    # Quota/rate limit — trying another model name won't help,
+                    # it's the same key's quota. Stop here so the caller can
+                    # surface this distinctly (so you know to rotate keys)
+                    # rather than looking like a generic failure.
+                    rate_limited = True
+                    last_err = f"model={model} status=429 body={res.text[:300]}"
+                    break
                 last_err = f"model={model} status={res.status_code} body={res.text[:300]}"
+        if rate_limited:
+            return {"verdict": "UNKNOWN", "reason": f"RATE_LIMITED: Gemini free-tier quota exceeded — rotate to a different GEMINI_API_KEY. Detail: {last_err}"}
         if res is None or res.status_code != 200:
             return {"verdict": "UNKNOWN", "reason": f"Gemini API error: {last_err}"}
         data = res.json()
@@ -798,10 +814,16 @@ async def _h_verify_claims(args: dict) -> dict:
     partial = sum(1 for r in report if r["status"] == "PARTIALLY VERIFIED")
     contradicted = sum(1 for r in report if r["status"] == "CONTRADICTED")
     unverified = sum(1 for r in report if r["status"].startswith("UNVERIFIED"))
+    rate_limited = any(
+        "RATE_LIMITED" in (s.get("reason") or "")
+        for r in report for s in r["sources"]
+    )
 
     out = f"## Claim Verification Report\n\n**Total Claims:** {len(claims)}\n"
     out += (f"✅ Verified: {verified} | ⚠️ Partial: {partial} | 🔴 Contradicted: {contradicted} | "
             f"❌ Unverified: {unverified}\n")
+    if rate_limited:
+        out += "\n🛑 **GEMINI RATE LIMITED:** Your GEMINI_API_KEY hit its free-tier quota during this check — the verdicts below are degraded (treated as UNKNOWN, not false positives). Rotate to a different GEMINI_API_KEY now, or call `research_api_status` to confirm.\n"
     if not use_llm:
         out += "\n⚠️ **Note:** GEMINI_API_KEY not configured — using a weaker keyword-overlap heuristic instead of real LLM judgment. Verdicts here are less reliable.\n"
     out += "\n"
@@ -1077,6 +1099,46 @@ async def _h_get_wikipedia_data(args: dict) -> dict:
     return {"topic": topic, "found": True, "report": out}
 
 
+async def _gemini_health_check() -> dict:
+    """Make one minimal, cheap generateContent call to find out Gemini's
+    actual live status — not configured / working / rate-limited (quota hit,
+    time to rotate keys) / model not found (deprecated) / other error."""
+    if not GEMINI_API_KEY:
+        return {
+            "status": "➖ Not set",
+            "note": "Optional — set GEMINI_API_KEY for real claim-verification (used by verify_claims)",
+        }
+    body = {
+        "contents": [{"parts": [{"text": "Reply with exactly one word: OK"}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 5},
+    }
+    try:
+        async with httpx.AsyncClient() as c:
+            res = await c.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json=body,
+                timeout=15,
+            )
+        if res.status_code == 200:
+            return {"status": f"✅ Working ({GEMINI_MODEL})", "note": "Live-checked just now — key is good and quota has room."}
+        if res.status_code == 429:
+            return {
+                "status": "🛑 RATE_LIMITED",
+                "note": f"Free-tier quota exceeded on this key ({GEMINI_MODEL}) — rotate to a different GEMINI_API_KEY now.",
+            }
+        if res.status_code == 404:
+            return {
+                "status": "⚠️ Model not found",
+                "note": f"'{GEMINI_MODEL}' returned 404 — Google may have retired/renamed this model. Check which free-tier model name is current and set GEMINI_MODEL.",
+            }
+        if res.status_code in (401, 403):
+            return {"status": "❌ Invalid key", "note": f"Status {res.status_code} — key may be wrong, disabled, or missing permissions. Detail: {res.text[:200]}"}
+        return {"status": f"❌ Error {res.status_code}", "note": res.text[:200]}
+    except Exception as e:
+        return {"status": "❌ Call failed", "note": f"{e}"}
+
+
 async def _h_research_api_status(_args: dict) -> dict:
     engines = {
         "wikipedia": {"status": "✅ Always on", "note": "Free API, no key needed. Rate-limited + cached.", "cache_size": len(_wiki_cache)},
@@ -1093,10 +1155,12 @@ async def _h_research_api_status(_args: dict) -> dict:
             "status": "✅ Configured" if TAVILY_API_KEY else "➖ Not set",
             "note": "AI research search" if TAVILY_API_KEY else "Optional — set TAVILY_API_KEY",
         },
+        "gemini": await _gemini_health_check(),
     }
     out = "## Research Server — API Status\n\n| Engine | Status | Details |\n|--------|--------|--------|\n"
     for name, info in engines.items():
         out += f"| {name} | {info['status']} | {info['note']} |\n"
+    out += "\n⚠️ If `gemini` shows RATE_LIMITED, verify_claims will fall back to a less reliable keyword check until you add a fresh GEMINI_API_KEY.\n"
     return {"engines": engines, "report": out}
 
 

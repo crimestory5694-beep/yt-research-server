@@ -503,7 +503,7 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 150},
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 250},
     }
     # Google has retired Gemini free-tier model names more than once during
     # development of this tool (gemini-2.5-flash, then gemini-2.0-flash both
@@ -549,9 +549,19 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         reason_m = re.search(r"REASON:\s*(.+)", text)
         verdict = m.group(1).upper() if m else "UNKNOWN"
         reason = reason_m.group(1).strip() if reason_m else text.strip()[:200]
+        # Guard against two ways this can come out unreadable in a markdown
+        # report: (1) Gemini occasionally echoes the prompt's own
+        # "<one short sentence>" placeholder verbatim instead of writing a
+        # real reason; (2) any literal "<"/">" in the reason gets swallowed
+        # by markdown/HTML renderers (observed as a reason truncated to a
+        # bare "<"). Strip angle brackets and fall back to a clear message
+        # when nothing usable is left.
+        reason = re.sub(r"[<>]", "", reason).strip()
+        if not reason or reason.lower() in ("one short sentence", ""):
+            reason = f"Gemini returned no usable reason text (raw: {text.strip()[:150]!r})" if text.strip() else "Gemini returned an empty response (no candidates — possibly blocked by safety filters or hit max output tokens)."
         return {"verdict": verdict, "reason": reason}
     except Exception as e:
-        return {"verdict": "UNKNOWN", "reason": f"Gemini call failed: {e}"}
+        return {"verdict": "UNKNOWN", "reason": f"Gemini call failed: {type(e).__name__}: {e}" if str(e) else f"Gemini call failed: {type(e).__name__} (no further detail — likely a timeout)"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -760,55 +770,74 @@ async def _h_deep_research(args: dict) -> dict:
     return {"report": out, "sources_count": len(sources)}
 
 
+async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
+    """Fetch + judge a single source for a single claim. Independent of every
+    other source/claim, so callers run many of these concurrently instead of
+    one at a time — the previous fully-sequential loop (fetch + Gemini call
+    per source, one after another) was the main cause of verify_claims
+    sometimes taking minutes on just a handful of claims."""
+    content = await fetch_page_content(r["url"], 2000)
+    has_content = bool(content and len(content) > 100)
+    if use_llm:
+        judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+        verdict = judged["verdict"]
+        reason = judged["reason"]
+    else:
+        # Fallback heuristic (keyword overlap only) — known to be fooled
+        # by ambiguous terms; still better than nothing when no LLM key
+        # is configured.
+        is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
+        verdict = "SUPPORTS" if (has_content and is_relevant) else "IRRELEVANT"
+        reason = "No LLM configured — keyword-overlap heuristic only (less reliable)."
+    return {
+        "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
+        "hasContent": has_content,
+        "verdict": verdict,
+        "reason": reason,
+        "contentPreview": ((content or r.get("snippet") or "")[:500]),
+    }
+
+
+async def _check_one_claim(claim: str, lang: str, use_llm: bool) -> dict:
+    raw_results = await unified_search(claim, max_results=5, language=lang, include_wikipedia=True)
+    # Cheap keyword pre-filter to drop obvious noise before spending an LLM
+    # call on it. This alone is NOT sufficient (see _gemini_judge's docstring
+    # for why — ambiguous words like "shorts" defeat keyword matching), so
+    # when GEMINI_API_KEY is set we additionally judge each surviving result
+    # with an LLM read of its actual content.
+    results = _filter_relevant(claim, raw_results)[:3]
+    checked = list(await asyncio.gather(
+        *[_check_one_source(claim, r, use_llm) for r in results],
+        return_exceptions=False,
+    )) if results else []
+    supports = sum(1 for c in checked if c["verdict"] == "SUPPORTS")
+    refutes = sum(1 for c in checked if c["verdict"] == "REFUTES")
+
+    if not raw_results or not results:
+        status, icon = "UNVERIFIED — no relevant sources found", "❌"
+    elif refutes > 0 and refutes >= supports:
+        status, icon = "CONTRADICTED", "🔴"
+    elif supports >= 2:
+        status, icon = "VERIFIED", "✅"
+    elif supports == 1:
+        status, icon = "PARTIALLY VERIFIED", "⚠️"
+    else:
+        status, icon = "UNVERIFIED", "❌"
+    return {"claim": claim, "status": status, "icon": icon, "sources": checked}
+
+
 async def _h_verify_claims(args: dict) -> dict:
-    claims = args["claims"]
+    claims = args["claims"][:20]
     lang = args.get("language", "en")
     use_llm = bool(GEMINI_API_KEY)
+    # Claims are independent of each other too, so run them concurrently in
+    # small batches (same pattern as multi_search) rather than one at a time.
     report = []
-    for claim in claims[:20]:
-        raw_results = await unified_search(claim, max_results=5, language=lang, include_wikipedia=True)
-        # Cheap keyword pre-filter to drop obvious noise before spending an LLM
-        # call on it. This alone is NOT sufficient (see _gemini_judge's docstring
-        # for why — ambiguous words like "shorts" defeat keyword matching), so
-        # when GEMINI_API_KEY is set we additionally judge each surviving result
-        # with an LLM read of its actual content.
-        results = _filter_relevant(claim, raw_results)[:3]
-        checked = []
-        for r in results:
-            content = await fetch_page_content(r["url"], 2000)
-            has_content = bool(content and len(content) > 100)
-            if use_llm:
-                judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
-                verdict = judged["verdict"]
-                reason = judged["reason"]
-            else:
-                # Fallback heuristic (keyword overlap only) — known to be fooled
-                # by ambiguous terms; still better than nothing when no LLM key
-                # is configured.
-                is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
-                verdict = "SUPPORTS" if (has_content and is_relevant) else "IRRELEVANT"
-                reason = "No LLM configured — keyword-overlap heuristic only (less reliable)."
-            checked.append({
-                "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
-                "hasContent": has_content,
-                "verdict": verdict,
-                "reason": reason,
-                "contentPreview": ((content or r.get("snippet") or "")[:500]),
-            })
-        supports = sum(1 for c in checked if c["verdict"] == "SUPPORTS")
-        refutes = sum(1 for c in checked if c["verdict"] == "REFUTES")
-
-        if not raw_results or not results:
-            status, icon = "UNVERIFIED — no relevant sources found", "❌"
-        elif refutes > 0 and refutes >= supports:
-            status, icon = "CONTRADICTED", "🔴"
-        elif supports >= 2:
-            status, icon = "VERIFIED", "✅"
-        elif supports == 1:
-            status, icon = "PARTIALLY VERIFIED", "⚠️"
-        else:
-            status, icon = "UNVERIFIED", "❌"
-        report.append({"claim": claim, "status": status, "icon": icon, "sources": checked})
+    batch_size = 4
+    for i in range(0, len(claims), batch_size):
+        batch = claims[i:i + batch_size]
+        batch_report = await asyncio.gather(*[_check_one_claim(c, lang, use_llm) for c in batch])
+        report.extend(batch_report)
 
     verified = sum(1 for r in report if r["status"] == "VERIFIED")
     partial = sum(1 for r in report if r["status"] == "PARTIALLY VERIFIED")
@@ -938,9 +967,11 @@ async def _h_check_content_saturation(args: dict) -> dict:
     topic = args["topic"]
     lang = args.get("language", "en")
 
-    web_results_raw = await unified_search(topic, max_results=10, language=lang, include_wikipedia=False)
-    yt_results_raw = await unified_search(f"{topic} YouTube video", max_results=5, language=lang, include_wikipedia=False)
-    wiki_results_raw = await search_wikipedia(topic, lang, 5)
+    web_results_raw, yt_results_raw, wiki_results_raw = await asyncio.gather(
+        unified_search(topic, max_results=10, language=lang, include_wikipedia=False),
+        unified_search(f"{topic} YouTube video", max_results=5, language=lang, include_wikipedia=False),
+        search_wikipedia(topic, lang, 5),
+    )
 
     # Only count results that are actually about the topic — the Wikipedia
     # full-text fallback in particular can return unrelated pages for a
@@ -1136,7 +1167,13 @@ async def _gemini_health_check() -> dict:
             return {"status": "❌ Invalid key", "note": f"Status {res.status_code} — key may be wrong, disabled, or missing permissions. Detail: {res.text[:200]}"}
         return {"status": f"❌ Error {res.status_code}", "note": res.text[:200]}
     except Exception as e:
-        return {"status": "❌ Call failed", "note": f"{e}"}
+        # str(e) is empty for several common httpx exceptions (e.g. a bare
+        # ReadTimeout/ConnectTimeout), which previously rendered as a
+        # content-free "note": "" — always include the exception type so
+        # there's something to act on (e.g. "ReadTimeout" => the call is
+        # timing out, not necessarily a bad key).
+        detail = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__} (no further detail — likely a timeout/connection issue reaching Gemini)"
+        return {"status": "❌ Call failed", "note": detail}
 
 
 async def _h_research_api_status(_args: dict) -> dict:

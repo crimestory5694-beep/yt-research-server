@@ -32,6 +32,8 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -461,6 +463,69 @@ def _filter_relevant(query: str, results: list, text_fields=("title", "snippet")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  LLM-BASED CLAIM JUDGING (Gemini)
+#  The keyword-overlap relevance filter above is a cheap pre-filter, but it
+#  cannot resolve genuine semantic ambiguity — e.g. a Wikipedia article about
+#  Goofy mentioning his classic animated "shorts" will keyword-match a claim
+#  about "YouTube Shorts" even though they are unrelated meanings of the same
+#  word. Judging whether a source actually supports/refutes/doesn't address a
+#  claim requires reading and understanding it, which needs an LLM call, not
+#  more keyword rules. This is optional — if GEMINI_API_KEY isn't configured,
+#  callers should fall back to the keyword heuristic.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _gemini_judge(claim: str, source_title: str, source_content: str) -> dict:
+    """Ask Gemini whether a source supports, refutes, or doesn't address a claim.
+    Returns {"verdict": "SUPPORTS"|"REFUTES"|"IRRELEVANT"|"UNKNOWN", "reason": str}.
+    UNKNOWN means the call failed/couldn't be parsed — callers should treat that
+    like "no usable evidence", never like support."""
+    if not GEMINI_API_KEY:
+        return {"verdict": "UNKNOWN", "reason": "GEMINI_API_KEY not configured"}
+
+    prompt = (
+        "You are fact-checking a single claim against ONE source. Be strict: a source only "
+        "\"SUPPORTS\" the claim if it actually contains information bearing on this specific "
+        "claim's subject — not just because it shares a word with it (e.g. a source about "
+        "Disney's animated \"shorts\" does NOT support a claim about \"YouTube Shorts\" even "
+        "though both contain the word \"shorts\" — different meanings, different subject).\n\n"
+        f'Claim: "{claim}"\n\n'
+        f"Source title: {source_title}\n"
+        f"Source content (excerpt):\n{(source_content or '')[:2000]}\n\n"
+        "Reply in EXACTLY this format, nothing else:\n"
+        "VERDICT: <SUPPORTS or REFUTES or IRRELEVANT>\n"
+        "REASON: <one short sentence>"
+    )
+    try:
+        async with httpx.AsyncClient() as c:
+            res = await c.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                params={"key": GEMINI_API_KEY},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0, "maxOutputTokens": 150},
+                },
+                timeout=20,
+            )
+        if res.status_code != 200:
+            return {"verdict": "UNKNOWN", "reason": f"Gemini API error {res.status_code}"}
+        data = res.json()
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        m = re.search(r"VERDICT:\s*(SUPPORTS|REFUTES|IRRELEVANT)", text, re.IGNORECASE)
+        reason_m = re.search(r"REASON:\s*(.+)", text)
+        verdict = m.group(1).upper() if m else "UNKNOWN"
+        reason = reason_m.group(1).strip() if reason_m else text.strip()[:200]
+        return {"verdict": verdict, "reason": reason}
+    except Exception as e:
+        return {"verdict": "UNKNOWN", "reason": f"Gemini call failed: {e}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UNIFIED SEARCH
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -669,47 +734,70 @@ async def _h_deep_research(args: dict) -> dict:
 async def _h_verify_claims(args: dict) -> dict:
     claims = args["claims"]
     lang = args.get("language", "en")
+    use_llm = bool(GEMINI_API_KEY)
     report = []
     for claim in claims[:20]:
         raw_results = await unified_search(claim, max_results=5, language=lang, include_wikipedia=True)
-        # Reject results that are just keyword noise from a weak fallback engine
-        # (e.g. Wikipedia full-text search matching stray words in a long claim)
-        # before they can count as "support" for the claim.
+        # Cheap keyword pre-filter to drop obvious noise before spending an LLM
+        # call on it. This alone is NOT sufficient (see _gemini_judge's docstring
+        # for why — ambiguous words like "shorts" defeat keyword matching), so
+        # when GEMINI_API_KEY is set we additionally judge each surviving result
+        # with an LLM read of its actual content.
         results = _filter_relevant(claim, raw_results)[:3]
         checked = []
         for r in results:
             content = await fetch_page_content(r["url"], 2000)
-            is_relevant_content = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
+            has_content = bool(content and len(content) > 100)
+            if use_llm:
+                judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+                verdict = judged["verdict"]
+                reason = judged["reason"]
+            else:
+                # Fallback heuristic (keyword overlap only) — known to be fooled
+                # by ambiguous terms; still better than nothing when no LLM key
+                # is configured.
+                is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
+                verdict = "SUPPORTS" if (has_content and is_relevant) else "IRRELEVANT"
+                reason = "No LLM configured — keyword-overlap heuristic only (less reliable)."
             checked.append({
                 "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
-                "hasContent": bool(content and len(content) > 100),
-                "isRelevant": is_relevant_content,
+                "hasContent": has_content,
+                "verdict": verdict,
+                "reason": reason,
                 "contentPreview": ((content or r.get("snippet") or "")[:500]),
             })
-        # A source only counts as supporting the claim if it both has real content
-        # AND is actually about the same subject as the claim.
-        strong = sum(1 for c in checked if c["hasContent"] and c["isRelevant"])
+        supports = sum(1 for c in checked if c["verdict"] == "SUPPORTS")
+        refutes = sum(1 for c in checked if c["verdict"] == "REFUTES")
+
         if not raw_results or not results:
             status, icon = "UNVERIFIED — no relevant sources found", "❌"
+        elif refutes > 0 and refutes >= supports:
+            status, icon = "CONTRADICTED", "🔴"
+        elif supports >= 2:
+            status, icon = "VERIFIED", "✅"
+        elif supports == 1:
+            status, icon = "PARTIALLY VERIFIED", "⚠️"
         else:
-            status = "VERIFIED" if strong >= 2 else ("PARTIALLY VERIFIED" if strong == 1 else "UNVERIFIED")
-            icon = "✅" if strong >= 2 else ("⚠️" if strong == 1 else "❌")
+            status, icon = "UNVERIFIED", "❌"
         report.append({"claim": claim, "status": status, "icon": icon, "sources": checked})
 
     verified = sum(1 for r in report if r["status"] == "VERIFIED")
     partial = sum(1 for r in report if r["status"] == "PARTIALLY VERIFIED")
+    contradicted = sum(1 for r in report if r["status"] == "CONTRADICTED")
     unverified = sum(1 for r in report if r["status"].startswith("UNVERIFIED"))
 
     out = f"## Claim Verification Report\n\n**Total Claims:** {len(claims)}\n"
-    out += f"✅ Verified: {verified} | ⚠️ Partial: {partial} | ❌ Unverified: {unverified}\n\n"
+    out += (f"✅ Verified: {verified} | ⚠️ Partial: {partial} | 🔴 Contradicted: {contradicted} | "
+            f"❌ Unverified: {unverified}\n")
+    if not use_llm:
+        out += "\n⚠️ **Note:** GEMINI_API_KEY not configured — using a weaker keyword-overlap heuristic instead of real LLM judgment. Verdicts here are less reliable.\n"
+    out += "\n"
     for r in report:
         out += f"### {r['icon']} {r['status']}\n**Claim:** \"{r['claim']}\"\n**Sources:**\n"
         for s in r["sources"]:
-            out += f"- [{s['title']}]({s['url']})\n"
-            if s.get("contentPreview"):
-                out += f"  > {s['contentPreview'][:200]}...\n"
+            out += f"- [{s['title']}]({s['url']}) — **{s['verdict']}**: {s.get('reason', '')}\n"
         out += "\n"
-    return {"report": out, "verified": verified, "partial": partial, "unverified": unverified}
+    return {"report": out, "verified": verified, "partial": partial, "contradicted": contradicted, "unverified": unverified}
 
 
 async def _h_find_primary_sources(args: dict) -> dict:

@@ -487,6 +487,11 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
     like "no usable evidence", never like support."""
     if not GEMINI_API_KEY:
         return {"verdict": "UNKNOWN", "reason": "GEMINI_API_KEY not configured"}
+    if not source_content or not source_content.strip():
+        # Don't spend an API call (and risk a 429/503) asking Gemini to judge
+        # nothing — Retest #8 showed it correctly says IRRELEVANT for empty
+        # content anyway, so decide that locally and save the round trip.
+        return {"verdict": "IRRELEVANT", "reason": "No content could be retrieved from this source (empty page/snippet) — nothing to evaluate."}
 
     prompt = (
         "You are fact-checking a single claim against ONE source. Be strict: a source only "
@@ -530,23 +535,33 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
             res = None
             for model in models_to_try:
                 req_body = body
-                res = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    params={"key": GEMINI_API_KEY},
-                    json=req_body,
-                    timeout=20,
-                )
-                if res.status_code == 400 and "thinkingConfig" in res.text:
-                    # This model/API version doesn't accept thinkingConfig —
-                    # retry the same model once without it rather than
-                    # treating it as a hard failure.
-                    req_body = body_no_thinking_cfg
+                # 503 UNAVAILABLE ("model is currently experiencing high
+                # demand") is transient per Google's own error text — retry
+                # the SAME model a couple of times with a short backoff
+                # before moving on, instead of giving up on one 503 (seen in
+                # Retest #8). 502/504 are the same kind of transient
+                # gateway error and get the same treatment.
+                for backoff_attempt in range(3):
                     res = await c.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                         params={"key": GEMINI_API_KEY},
                         json=req_body,
                         timeout=20,
                     )
+                    if res.status_code == 400 and "thinkingConfig" in res.text:
+                        # This model/API version doesn't accept thinkingConfig —
+                        # retry the same model once without it rather than
+                        # treating it as a hard failure.
+                        req_body = body_no_thinking_cfg
+                        res = await c.post(
+                            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                            params={"key": GEMINI_API_KEY},
+                            json=req_body,
+                            timeout=20,
+                        )
+                    if res.status_code not in (502, 503, 504) or backoff_attempt == 2:
+                        break
+                    await asyncio.sleep(0.75 * (2 ** backoff_attempt))  # 0.75s, 1.5s
                 if res.status_code == 200:
                     break
                 if res.status_code == 429:
@@ -560,6 +575,8 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
                 last_err = f"model={model} status={res.status_code} body={res.text[:300]}"
         if rate_limited:
             return {"verdict": "UNKNOWN", "reason": f"RATE_LIMITED: Gemini free-tier quota exceeded — rotate to a different GEMINI_API_KEY. Detail: {last_err}"}
+        if res is not None and res.status_code in (502, 503, 504):
+            return {"verdict": "UNKNOWN", "reason": f"UNAVAILABLE: Gemini is temporarily overloaded (tried {res.status_code} 3x with backoff) — this is transient on Google's side, not a key/quota problem; retry the check shortly. Detail: {last_err}"}
         if res is None or res.status_code != 200:
             return {"verdict": "UNKNOWN", "reason": f"Gemini API error: {last_err}"}
         data = res.json()
@@ -867,13 +884,18 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
 
 
 async def _check_one_claim(claim: str, lang: str, use_llm: bool) -> dict:
-    raw_results = await unified_search(claim, max_results=5, language=lang, include_wikipedia=True)
+    raw_results = await unified_search(claim, max_results=8, language=lang, include_wikipedia=True)
     # Cheap keyword pre-filter to drop obvious noise before spending an LLM
     # call on it. This alone is NOT sufficient (see _gemini_judge's docstring
     # for why — ambiguous words like "shorts" defeat keyword matching), so
     # when GEMINI_API_KEY is set we additionally judge each surviving result
     # with an LLM read of its actual content.
-    results = _filter_relevant(claim, raw_results)[:3]
+    # Check 5 candidates, not 3: Retest #8 showed a relevant-looking source
+    # often turns out empty/unfetchable (one Reddit thread had no retrievable
+    # content) or hits a transient Gemini error — pulling a wider pool means
+    # a bad one gets naturally offset by other real evidence instead of
+    # shrinking the evidence set down to 2 or fewer.
+    results = _filter_relevant(claim, raw_results)[:5]
     checked = list(await asyncio.gather(
         *[_check_one_source(claim, r, use_llm) for r in results],
         return_exceptions=False,

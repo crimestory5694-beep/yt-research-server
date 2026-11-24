@@ -855,6 +855,61 @@ async def _h_deep_research(args: dict) -> dict:
     return {"report": out, "sources_count": len(sources)}
 
 
+_BOILERPLATE_MARKERS = (
+    "all rights reserved", "privacy policy", "terms of service", "terms of use",
+    "cookie policy", "subscribe to our newsletter", "sign in to continue",
+    "enable javascript", "please enable cookies", "accept all cookies",
+)
+
+
+def _is_usable_content(content: Optional[str]) -> bool:
+    """Cheap local check to reject empty pages and nav/footer-only scrapes
+    BEFORE spending a Gemini call on them (Retest #9: 3/5 sources were empty,
+    1/5 was footer-only — all four wasted a full judging round trip for a
+    verdict that was foreseeable locally). Imperfect on purpose: it only
+    catches the common, clear-cut cases rather than trying to be a second
+    content classifier."""
+    if not content or len(content.strip()) < 150:
+        return False
+    low = content.lower()
+    hits = sum(1 for m in _BOILERPLATE_MARKERS if m in low)
+    if hits >= 2 and len(content.strip()) < 600:
+        return False
+    return True
+
+
+def _domain_of(url: str) -> str:
+    try:
+        host = url.split("://", 1)[-1].split("/", 1)[0].lower()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return url
+
+
+# Not an exhaustive authority list — a pragmatic nudge, same spirit as the
+# rest of this file's heuristics. Forums/Q&A sites are moved down (they're
+# rarely where a specific numeric claim like an RPM figure gets published
+# first), general reputable publications/outlets moved up.
+_LOW_AUTHORITY_DOMAINS = ("reddit.com", "quora.com", "pinterest.com", "facebook.com", "x.com", "twitter.com", "tiktok.com", "answers.com")
+_HIGH_AUTHORITY_DOMAINS = (
+    "digiday.com", "theverge.com", "techcrunch.com", "backlinko.com", "tubefilter.com",
+    "socialblade.com", "vidiq.com", "searchenginejournal.com", "forbes.com",
+    "businessinsider.com", "nytimes.com", "wsj.com", "washingtonpost.com",
+    "bloomberg.com", "reuters.com", "cnbc.com", "adweek.com", "marketingdive.com",
+)
+
+
+def _authority_score(url: str) -> int:
+    d = _domain_of(url)
+    if d.endswith(".gov") or d.endswith(".edu"):
+        return 5
+    if any(d == h or d.endswith("." + h) for h in _HIGH_AUTHORITY_DOMAINS):
+        return 4
+    if any(d == l or d.endswith("." + l) for l in _LOW_AUTHORITY_DOMAINS):
+        return -3
+    return 0
+
+
 async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
     """Fetch + judge a single source for a single claim. Independent of every
     other source/claim, so callers run many of these concurrently instead of
@@ -862,21 +917,27 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
     per source, one after another) was the main cause of verify_claims
     sometimes taking minutes on just a handful of claims."""
     content = await fetch_page_content(r["url"], 2000)
-    has_content = bool(content and len(content) > 100)
+    usable = _is_usable_content(content)
     if use_llm:
-        judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
-        verdict = judged["verdict"]
-        reason = judged["reason"]
+        if not usable:
+            # Don't spend a Gemini call (and a shot at hitting 429/503) on
+            # something that's locally and cheaply detectable as empty or
+            # footer/cookie-banner-only text.
+            verdict, reason = "IRRELEVANT", "NO_USABLE_CONTENT: page returned empty or footer/boilerplate-only text — nothing to evaluate."
+        else:
+            judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+            verdict = judged["verdict"]
+            reason = judged["reason"]
     else:
         # Fallback heuristic (keyword overlap only) — known to be fooled
         # by ambiguous terms; still better than nothing when no LLM key
         # is configured.
         is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
-        verdict = "SUPPORTS" if (has_content and is_relevant) else "IRRELEVANT"
+        verdict = "SUPPORTS" if (usable and is_relevant) else "IRRELEVANT"
         reason = "No LLM configured — keyword-overlap heuristic only (less reliable)."
     return {
         "title": r["title"], "url": r["url"], "snippet": r.get("snippet", ""),
-        "hasContent": has_content,
+        "hasContent": usable,
         "verdict": verdict,
         "reason": reason,
         "contentPreview": ((content or r.get("snippet") or "")[:500]),
@@ -884,22 +945,61 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
 
 
 async def _check_one_claim(claim: str, lang: str, use_llm: bool) -> dict:
-    raw_results = await unified_search(claim, max_results=8, language=lang, include_wikipedia=True)
+    # Query expansion: the bare claim sentence alone is what kept surfacing
+    # Reddit/Quora opinion threads (Retest #9) — a second, data-flavored
+    # phrasing run in parallel nudges search engines toward the kind of
+    # publication that actually reports a number like an RPM comparison.
+    queries = [claim, f"{claim} statistics data report"]
+    raw_arrays = await asyncio.gather(
+        *[unified_search(q, max_results=8, language=lang, include_wikipedia=True) for q in queries]
+    )
+    seen_urls = set()
+    raw_results = []
+    for arr in raw_arrays:
+        for r in arr:
+            norm = r["url"].rstrip("/").replace("https://www.", "https://")
+            if norm not in seen_urls:
+                seen_urls.add(norm)
+                raw_results.append(r)
+
     # Cheap keyword pre-filter to drop obvious noise before spending an LLM
     # call on it. This alone is NOT sufficient (see _gemini_judge's docstring
     # for why — ambiguous words like "shorts" defeat keyword matching), so
     # when GEMINI_API_KEY is set we additionally judge each surviving result
     # with an LLM read of its actual content.
-    # Check 5 candidates, not 3: Retest #8 showed a relevant-looking source
-    # often turns out empty/unfetchable (one Reddit thread had no retrievable
-    # content) or hits a transient Gemini error — pulling a wider pool means
-    # a bad one gets naturally offset by other real evidence instead of
-    # shrinking the evidence set down to 2 or fewer.
-    results = _filter_relevant(claim, raw_results)[:5]
+    relevant = _filter_relevant(claim, raw_results)
+    # Prioritize authoritative publications over forums/Q&A sites (stable
+    # sort — keeps the underlying relevance order as the tiebreak), and cap
+    # how many results from the same domain can appear so the final evidence
+    # set isn't 3 sources that are really one publisher.
+    relevant.sort(key=lambda r: -_authority_score(r["url"]))
+    domain_counts: dict = {}
+    deduped = []
+    for r in relevant:
+        d = _domain_of(r["url"])
+        if domain_counts.get(d, 0) >= 2:
+            continue
+        domain_counts[d] = domain_counts.get(d, 0) + 1
+        deduped.append(r)
+
+    # Bounded search budget: check a first wave of 5, and only spend a
+    # second wave of up to 3 more if that wasn't enough usable evidence
+    # (Retest #9: 4/5 sources turned out empty/footer-only) — rather than
+    # unboundedly retrying until something sticks.
+    wave1 = deduped[:5]
     checked = list(await asyncio.gather(
-        *[_check_one_source(claim, r, use_llm) for r in results],
+        *[_check_one_source(claim, r, use_llm) for r in wave1],
         return_exceptions=False,
-    )) if results else []
+    )) if wave1 else []
+    usable_count = sum(1 for c in checked if "NO_USABLE_CONTENT" not in c["reason"])
+    if usable_count < 2 and len(deduped) > 5:
+        wave2 = deduped[5:8]
+        checked += list(await asyncio.gather(
+            *[_check_one_source(claim, r, use_llm) for r in wave2],
+            return_exceptions=False,
+        ))
+
+    results = checked  # for the "no relevant sources" check below
     supports = sum(1 for c in checked if c["verdict"] == "SUPPORTS")
     refutes = sum(1 for c in checked if c["verdict"] == "REFUTES")
 

@@ -910,15 +910,27 @@ def _authority_score(url: str) -> int:
     return 0
 
 
-async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
+async def _check_one_source(claim: str, r: dict, use_llm: bool, quota_state: Optional[dict] = None) -> dict:
     """Fetch + judge a single source for a single claim. Independent of every
     other source/claim, so callers run many of these concurrently instead of
     one at a time — the previous fully-sequential loop (fetch + Gemini call
     per source, one after another) was the main cause of verify_claims
-    sometimes taking minutes on just a handful of claims."""
+    sometimes taking minutes on just a handful of claims.
+
+    quota_state is a plain dict shared across every source/claim in one
+    verify_claims call. Retest #10 hit a hard "exceeded your current quota"
+    429 (not a transient per-minute limit _gemini_judge already retries
+    around) partway through — once that's seen, every remaining source in
+    this same request is guaranteed to hit the same wall, so we stop paying
+    the latency/noise of calling Gemini again and go straight to the
+    keyword heuristic for the rest of this batch instead."""
     content = await fetch_page_content(r["url"], 2000)
     usable = _is_usable_content(content)
-    if use_llm:
+    if use_llm and quota_state is not None and quota_state.get("rate_limited"):
+        is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
+        verdict = "SUPPORTS" if (usable and is_relevant) else "IRRELEVANT"
+        reason = "RATE_LIMITED: Gemini quota was already exhausted earlier in this same request — skipping the Gemini call here and using the keyword-overlap heuristic instead (less reliable). Rotate GEMINI_API_KEY and retry for a real judgment."
+    elif use_llm:
         if not usable:
             # Don't spend a Gemini call (and a shot at hitting 429/503) on
             # something that's locally and cheaply detectable as empty or
@@ -928,6 +940,8 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
             judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
             verdict = judged["verdict"]
             reason = judged["reason"]
+            if quota_state is not None and "RATE_LIMITED" in reason and "quota was already exhausted" not in reason:
+                quota_state["rate_limited"] = True
     else:
         # Fallback heuristic (keyword overlap only) — known to be fooled
         # by ambiguous terms; still better than nothing when no LLM key
@@ -944,7 +958,7 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool) -> dict:
     }
 
 
-async def _check_one_claim(claim: str, lang: str, use_llm: bool) -> dict:
+async def _check_one_claim(claim: str, lang: str, use_llm: bool, quota_state: Optional[dict] = None) -> dict:
     # Query expansion: the bare claim sentence alone is what kept surfacing
     # Reddit/Quora opinion threads (Retest #9) — a second, data-flavored
     # phrasing run in parallel nudges search engines toward the kind of
@@ -988,14 +1002,19 @@ async def _check_one_claim(claim: str, lang: str, use_llm: bool) -> dict:
     # unboundedly retrying until something sticks.
     wave1 = deduped[:5]
     checked = list(await asyncio.gather(
-        *[_check_one_source(claim, r, use_llm) for r in wave1],
+        *[_check_one_source(claim, r, use_llm, quota_state) for r in wave1],
         return_exceptions=False,
     )) if wave1 else []
     usable_count = sum(1 for c in checked if "NO_USABLE_CONTENT" not in c["reason"])
-    if usable_count < 2 and len(deduped) > 5:
+    # Once quota is known exhausted, a second wave of Gemini calls can't
+    # produce better evidence quality than wave 1 did (same heuristic
+    # fallback either way) — skip it rather than spending more page fetches
+    # for no gain.
+    already_rate_limited = bool(quota_state and quota_state.get("rate_limited"))
+    if usable_count < 2 and len(deduped) > 5 and not already_rate_limited:
         wave2 = deduped[5:8]
         checked += list(await asyncio.gather(
-            *[_check_one_source(claim, r, use_llm) for r in wave2],
+            *[_check_one_source(claim, r, use_llm, quota_state) for r in wave2],
             return_exceptions=False,
         ))
 
@@ -1024,9 +1043,16 @@ async def _h_verify_claims(args: dict) -> dict:
     # small batches (same pattern as multi_search) rather than one at a time.
     report = []
     batch_size = 4
+    # Shared across every claim/source in this one verify_claims call: once
+    # any call reports Gemini's quota as exhausted (not just a transient
+    # per-minute 429 — _gemini_judge's own retry/backoff already handles
+    # those), stop spending further Gemini calls for the rest of THIS
+    # request and fall back to the heuristic, instead of re-discovering the
+    # same 429 on every remaining source.
+    quota_state: dict = {"rate_limited": False}
     for i in range(0, len(claims), batch_size):
         batch = claims[i:i + batch_size]
-        batch_report = await asyncio.gather(*[_check_one_claim(c, lang, use_llm) for c in batch])
+        batch_report = await asyncio.gather(*[_check_one_claim(c, lang, use_llm, quota_state) for c in batch])
         report.extend(batch_report)
 
     verified = sum(1 for r in report if r["status"] == "VERIFIED")

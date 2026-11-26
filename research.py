@@ -39,6 +39,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # free-tier equivalent as of testing; override via GEMINI_MODEL if Google
 # changes free-tier availability again.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Groq — free, OpenAI-compatible, used as a second LLM judge ONLY when Gemini
+# is confirmed rate-limited/unavailable for a given call, so claim verification
+# doesn't silently drop to the much weaker keyword heuristic every time
+# Gemini's free-tier quota runs out (which testing showed happens fast).
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -480,6 +486,95 @@ def _filter_relevant(query: str, results: list, text_fields=("title", "snippet")
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _build_judge_prompt(claim: str, source_title: str, source_content: str) -> str:
+    """Shared prompt for every LLM judge (Gemini, Groq, ...) so a claim gets
+    the exact same question asked regardless of which model answers it."""
+    return (
+        "You are fact-checking a single claim against ONE source. Be strict: a source only "
+        "\"SUPPORTS\" the claim if it actually contains information bearing on this specific "
+        "claim's subject — not just because it shares a word with it (e.g. a source about "
+        "Disney's animated \"shorts\" does NOT support a claim about \"YouTube Shorts\" even "
+        "though both contain the word \"shorts\" — different meanings, different subject).\n\n"
+        f'Claim: "{claim}"\n\n'
+        f"Source title: {source_title}\n"
+        f"Source content (excerpt):\n{(source_content or '')[:2000]}\n\n"
+        "Reply in EXACTLY this format, nothing else:\n"
+        "VERDICT: <SUPPORTS or REFUTES or IRRELEVANT>\n"
+        "REASON: <one short sentence>"
+    )
+
+
+def _parse_judge_response(text: str, finish_reason: str = "") -> dict:
+    """Shared VERDICT/REASON parser for every LLM judge. Handles a response
+    truncated mid-word (recovers an unambiguous verdict from a 4+ char
+    prefix), Gemini's occasional verbatim echo of the "<one short sentence>"
+    placeholder, and literal "<"/">" getting swallowed by markdown
+    rendering. Returns {"verdict": ..., "reason": ...}."""
+    m = re.search(r"VERDICT:\s*(SUPPORTS|REFUTES|IRRELEVANT)", text, re.IGNORECASE)
+    truncated_verdict = False
+    verdict_word = None
+    if not m:
+        pm = re.search(r"VERDICT:\s*([A-Z]{4,})", text, re.IGNORECASE)
+        if pm:
+            prefix = pm.group(1).upper()
+            for word in ("SUPPORTS", "REFUTES", "IRRELEVANT"):
+                if word.startswith(prefix):
+                    m = True
+                    verdict_word = word
+                    truncated_verdict = True
+                    break
+    reason_m = re.search(r"REASON:\s*(.+)", text)
+    if m is True:
+        verdict = verdict_word
+    else:
+        verdict = m.group(1).upper() if m else "UNKNOWN"
+    reason = reason_m.group(1).strip() if reason_m else text.strip()[:200]
+    reason = re.sub(r"[<>]", "", reason).strip()
+    if not reason or reason.lower() in ("one short sentence", ""):
+        reason = f"Gemini returned no usable reason text (raw: {text.strip()[:150]!r})" if text.strip() else "Gemini returned an empty response (no candidates — possibly blocked by safety filters or hit max output tokens)."
+    if finish_reason == "MAX_TOKENS" or truncated_verdict:
+        prefix = "TRUNCATED (verdict recovered from a cut-off response): " if truncated_verdict else "TRUNCATED (hit max output tokens): "
+        reason = prefix + reason
+    return {"verdict": verdict, "reason": reason}
+
+
+async def _groq_judge(claim: str, source_title: str, source_content: str) -> dict:
+    """Second LLM judge via Groq's free, OpenAI-compatible API. Only called
+    as a fallback when Gemini is confirmed rate-limited/unavailable for this
+    request — so claim verification keeps using a real LLM judgment instead
+    of dropping straight to the much weaker keyword heuristic every time
+    Gemini's quota runs out."""
+    if not GROQ_API_KEY:
+        return {"verdict": "UNKNOWN", "reason": "GROQ_API_KEY not configured"}
+    if not source_content or not source_content.strip():
+        return {"verdict": "IRRELEVANT", "reason": "No content could be retrieved from this source (empty page/snippet) — nothing to evaluate."}
+    prompt = _build_judge_prompt(claim, source_title, source_content)
+    try:
+        async with httpx.AsyncClient() as c:
+            res = await c.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": 300,
+                },
+                timeout=20,
+            )
+        if res.status_code == 429:
+            return {"verdict": "UNKNOWN", "reason": f"RATE_LIMITED: Groq free-tier quota exceeded too — rotate GROQ_API_KEY. Detail: {res.text[:300]}"}
+        if res.status_code != 200:
+            return {"verdict": "UNKNOWN", "reason": f"Groq API error: status={res.status_code} body={res.text[:300]}"}
+        data = res.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = _parse_judge_response(text)
+        parsed["reason"] = "[via Groq fallback — Gemini was unavailable] " + parsed["reason"]
+        return parsed
+    except Exception as e:
+        return {"verdict": "UNKNOWN", "reason": f"Groq call failed: {type(e).__name__}: {e}" if str(e) else f"Groq call failed: {type(e).__name__} (no further detail — likely a timeout)"}
+
+
 async def _gemini_judge(claim: str, source_title: str, source_content: str) -> dict:
     """Ask Gemini whether a source supports, refutes, or doesn't address a claim.
     Returns {"verdict": "SUPPORTS"|"REFUTES"|"IRRELEVANT"|"UNKNOWN", "reason": str}.
@@ -493,19 +588,7 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
         # content anyway, so decide that locally and save the round trip.
         return {"verdict": "IRRELEVANT", "reason": "No content could be retrieved from this source (empty page/snippet) — nothing to evaluate."}
 
-    prompt = (
-        "You are fact-checking a single claim against ONE source. Be strict: a source only "
-        "\"SUPPORTS\" the claim if it actually contains information bearing on this specific "
-        "claim's subject — not just because it shares a word with it (e.g. a source about "
-        "Disney's animated \"shorts\" does NOT support a claim about \"YouTube Shorts\" even "
-        "though both contain the word \"shorts\" — different meanings, different subject).\n\n"
-        f'Claim: "{claim}"\n\n'
-        f"Source title: {source_title}\n"
-        f"Source content (excerpt):\n{(source_content or '')[:2000]}\n\n"
-        "Reply in EXACTLY this format, nothing else:\n"
-        "VERDICT: <SUPPORTS or REFUTES or IRRELEVANT>\n"
-        "REASON: <one short sentence>"
-    )
+    prompt = _build_judge_prompt(claim, source_title, source_content)
     # thinkingBudget: 0 turns off Gemini's internal "thinking" tokens, which
     # on gemini-3.x models are otherwise generated INSIDE the same
     # maxOutputTokens budget as the visible answer — Retest #7 showed
@@ -588,46 +671,7 @@ async def _gemini_judge(claim: str, source_title: str, source_content: str) -> d
             .get("parts", [{}])[0]
             .get("text", "")
         )
-        m = re.search(r"VERDICT:\s*(SUPPORTS|REFUTES|IRRELEVANT)", text, re.IGNORECASE)
-        truncated_verdict = False
-        if not m:
-            # Response got cut off mid-word before finishing the VERDICT
-            # line (e.g. "VERDICT: IRRELEV") — an unambiguous prefix of one
-            # of the three allowed words is still a usable verdict, just a
-            # truncated one. Only recover when the prefix is long enough
-            # (4+ chars) to be unambiguous between SUPPORTS/REFUTES/IRRELEVANT.
-            pm = re.search(r"VERDICT:\s*([A-Z]{4,})", text, re.IGNORECASE)
-            if pm:
-                prefix = pm.group(1).upper()
-                for word in ("SUPPORTS", "REFUTES", "IRRELEVANT"):
-                    if word.startswith(prefix):
-                        m = True
-                        verdict_word = word
-                        truncated_verdict = True
-                        break
-        reason_m = re.search(r"REASON:\s*(.+)", text)
-        if m is True:
-            verdict = verdict_word
-        else:
-            verdict = m.group(1).upper() if m else "UNKNOWN"
-        reason = reason_m.group(1).strip() if reason_m else text.strip()[:200]
-        # Guard against ways this can come out unreadable or misleading in a
-        # markdown report: (1) Gemini occasionally echoes the prompt's own
-        # "<one short sentence>" placeholder verbatim instead of writing a
-        # real reason; (2) any literal "<"/">" in the reason gets swallowed
-        # by markdown/HTML renderers (observed as a reason truncated to a
-        # bare "<"). Strip angle brackets and fall back to a clear message
-        # when nothing usable is left.
-        reason = re.sub(r"[<>]", "", reason).strip()
-        if not reason or reason.lower() in ("one short sentence", ""):
-            reason = f"Gemini returned no usable reason text (raw: {text.strip()[:150]!r})" if text.strip() else "Gemini returned an empty response (no candidates — possibly blocked by safety filters or hit max output tokens)."
-        if finish_reason == "MAX_TOKENS" or truncated_verdict:
-            # Make truncation visible rather than silently guessing — same
-            # pattern as the RATE_LIMITED marker, so this is easy to spot
-            # and distinguish from a genuine model judgment in ChatGPT output.
-            prefix = "TRUNCATED (verdict recovered from a cut-off response): " if truncated_verdict else "TRUNCATED (hit max output tokens): "
-            reason = prefix + reason
-        return {"verdict": verdict, "reason": reason}
+        return _parse_judge_response(text, finish_reason)
     except Exception as e:
         return {"verdict": "UNKNOWN", "reason": f"Gemini call failed: {type(e).__name__}: {e}" if str(e) else f"Gemini call failed: {type(e).__name__} (no further detail — likely a timeout)"}
 
@@ -921,27 +965,42 @@ async def _check_one_source(claim: str, r: dict, use_llm: bool, quota_state: Opt
     verify_claims call. Retest #10 hit a hard "exceeded your current quota"
     429 (not a transient per-minute limit _gemini_judge already retries
     around) partway through — once that's seen, every remaining source in
-    this same request is guaranteed to hit the same wall, so we stop paying
-    the latency/noise of calling Gemini again and go straight to the
-    keyword heuristic for the rest of this batch instead."""
+    this same request would hit the same wall. Rather than dropping straight
+    to the much weaker keyword heuristic for the rest of the batch, each of
+    those sources is instead judged by Groq (a second, free, OpenAI-compatible
+    LLM) when GROQ_API_KEY is configured, so real LLM judgment keeps
+    happening — only falling back to the heuristic if Groq isn't set up or
+    also fails."""
     content = await fetch_page_content(r["url"], 2000)
     usable = _is_usable_content(content)
-    if use_llm and quota_state is not None and quota_state.get("rate_limited"):
-        is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
-        verdict = "SUPPORTS" if (usable and is_relevant) else "IRRELEVANT"
-        reason = "RATE_LIMITED: Gemini quota was already exhausted earlier in this same request — skipping the Gemini call here and using the keyword-overlap heuristic instead (less reliable). Rotate GEMINI_API_KEY and retry for a real judgment."
-    elif use_llm:
-        if not usable:
-            # Don't spend a Gemini call (and a shot at hitting 429/503) on
-            # something that's locally and cheaply detectable as empty or
-            # footer/cookie-banner-only text.
-            verdict, reason = "IRRELEVANT", "NO_USABLE_CONTENT: page returned empty or footer/boilerplate-only text — nothing to evaluate."
+    gemini_known_down = bool(use_llm and quota_state is not None and quota_state.get("rate_limited"))
+    if use_llm and not usable:
+        # Don't spend an LLM call (and a shot at hitting 429/503) on
+        # something that's locally and cheaply detectable as empty or
+        # footer/cookie-banner-only text.
+        verdict, reason = "IRRELEVANT", "NO_USABLE_CONTENT: page returned empty or footer/boilerplate-only text — nothing to evaluate."
+    elif use_llm and gemini_known_down:
+        if GROQ_API_KEY:
+            judged = await _groq_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+            verdict, reason = judged["verdict"], judged["reason"]
         else:
-            judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
-            verdict = judged["verdict"]
-            reason = judged["reason"]
-            if quota_state is not None and "RATE_LIMITED" in reason and "quota was already exhausted" not in reason:
+            is_relevant = _is_relevant(claim, r.get("title", ""), r.get("snippet", ""), content or "")
+            verdict = "SUPPORTS" if (usable and is_relevant) else "IRRELEVANT"
+            reason = "RATE_LIMITED: Gemini quota was already exhausted earlier in this same request, and no GROQ_API_KEY is configured as a fallback — using the keyword-overlap heuristic instead (less reliable). Rotate GEMINI_API_KEY, or add GROQ_API_KEY, for a real judgment."
+    elif use_llm:
+        judged = await _gemini_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+        verdict = judged["verdict"]
+        reason = judged["reason"]
+        if ("RATE_LIMITED" in reason or "UNAVAILABLE" in reason) and GROQ_API_KEY:
+            # Gemini hit a wall on THIS call too — try Groq right away for
+            # this same source instead of settling for UNKNOWN, and flag the
+            # shared state so the rest of the batch skips straight to Groq.
+            if quota_state is not None:
                 quota_state["rate_limited"] = True
+            judged2 = await _groq_judge(claim, r.get("title", ""), content or r.get("snippet", ""))
+            verdict, reason = judged2["verdict"], judged2["reason"]
+        elif quota_state is not None and "RATE_LIMITED" in reason:
+            quota_state["rate_limited"] = True
     else:
         # Fallback heuristic (keyword overlap only) — known to be fooled
         # by ambiguous terms; still better than nothing when no LLM key
@@ -1425,6 +1484,36 @@ async def _gemini_health_check() -> dict:
         return {"status": "❌ Call failed", "note": detail}
 
 
+async def _groq_health_check() -> dict:
+    """Same idea as _gemini_health_check, for Groq — the fallback LLM judge
+    used when Gemini is rate-limited/unavailable."""
+    if not GROQ_API_KEY:
+        return {
+            "status": "➖ Not set",
+            "note": "Optional — set GROQ_API_KEY as a free fallback judge for verify_claims when Gemini's quota is exhausted",
+        }
+    try:
+        async with httpx.AsyncClient() as c:
+            res = await c.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": "Reply with exactly one word: OK"}], "temperature": 0, "max_tokens": 10},
+                timeout=20,
+            )
+        if res.status_code == 200:
+            return {"status": f"✅ Working ({GROQ_MODEL})", "note": "Live-checked just now — key is good and quota has room."}
+        if res.status_code == 429:
+            return {"status": "🛑 RATE_LIMITED", "note": f"Free-tier quota exceeded on this key ({GROQ_MODEL}) — rotate to a different GROQ_API_KEY now."}
+        if res.status_code in (401, 403):
+            return {"status": "❌ Invalid key", "note": f"Status {res.status_code} — key may be wrong, disabled, or missing permissions. Detail: {res.text[:200]}"}
+        if res.status_code == 404:
+            return {"status": "⚠️ Model not found", "note": f"'{GROQ_MODEL}' returned 404 — check Groq's current model list and set GROQ_MODEL."}
+        return {"status": f"❌ Error {res.status_code}", "note": res.text[:200]}
+    except Exception as e:
+        detail = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__} (no further detail — likely a timeout/connection issue reaching Groq)"
+        return {"status": "❌ Call failed", "note": detail}
+
+
 async def _h_research_api_status(_args: dict) -> dict:
     engines = {
         "wikipedia": {"status": "✅ Always on", "note": "Free API, no key needed. Rate-limited + cached.", "cache_size": len(_wiki_cache)},
@@ -1442,25 +1531,35 @@ async def _h_research_api_status(_args: dict) -> dict:
             "note": "AI research search" if TAVILY_API_KEY else "Optional — set TAVILY_API_KEY",
         },
         "gemini": await _gemini_health_check(),
+        "groq": await _groq_health_check(),
     }
     gemini_rate_limited = "RATE_LIMITED" in engines["gemini"]["status"]
+    groq_working = engines["groq"]["status"].startswith("✅")
+    # Only escalate to the loud "replace your key now" banner when there's
+    # genuinely no real-LLM fallback left — Groq configured and healthy means
+    # verify_claims keeps getting actual LLM judgments even while Gemini's
+    # quota is exhausted, so it isn't an emergency in that case.
+    needs_action = gemini_rate_limited and not groq_working
     out = ""
-    if gemini_rate_limited:
+    if needs_action:
         # First line, in caps, with the concrete action — not buried after
         # the table — so a chat client summarizing this tool's output can't
         # easily drop it.
         out += ("🛑 ACTION REQUIRED — GEMINI_API_KEY QUOTA EXCEEDED 🛑\n"
                 "Replace GEMINI_API_KEY on Render now (Environment tab -> edit the value -> Save, rebuild, and deploy) "
-                "with a different Gemini key.\n\n")
+                "with a different Gemini key, or set GROQ_API_KEY as a free fallback judge.\n\n")
+    elif gemini_rate_limited and groq_working:
+        out += "ℹ️ Gemini's quota is exhausted right now, but Groq is configured and working — verify_claims will automatically use Groq as a fallback judge, so no action is needed immediately.\n\n"
     out += "## Research Server — API Status\n\n| Engine | Status | Details |\n|--------|--------|--------|\n"
     for name, info in engines.items():
         out += f"| {name} | {info['status']} | {info['note']} |\n"
-    out += "\n⚠️ If `gemini` shows RATE_LIMITED, verify_claims will fall back to a less reliable keyword check until you add a fresh GEMINI_API_KEY.\n"
+    out += "\n⚠️ If `gemini` shows RATE_LIMITED and `groq` isn't working either, verify_claims will fall back to a less reliable keyword check until you add a fresh key.\n"
     return {
         "engines": engines,
         "report": out,
         "gemini_rate_limited": gemini_rate_limited,
-        "action_required": "Replace GEMINI_API_KEY on Render with a different key — current one has hit its quota." if gemini_rate_limited else None,
+        "groq_working": groq_working,
+        "action_required": "Replace GEMINI_API_KEY on Render with a different key, or set GROQ_API_KEY as a fallback — current Gemini key has hit its quota and no working fallback is configured." if needs_action else None,
     }
 
 
